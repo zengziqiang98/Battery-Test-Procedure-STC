@@ -19,6 +19,8 @@
 #include "STC8H_PWM.h"
 #include "i2c_cmd.h"
 
+#define EXECUTOR_DEBUG_UART 0
+
 void SetChargeParamsByBatteryType(void);
 
 xdata unsigned int curChargeMAH;
@@ -205,6 +207,52 @@ static unsigned long chg_complete_wait_start_tick,dischg_complete_wait_start_tic
 static unsigned char chg_overc_waiting,dischg_overd_waiting;
 static unsigned char chg_complete_waiting,dischg_complete_waiting;
 
+#if EXECUTOR_DEBUG_UART
+static void dbg_puts(char *s)
+{
+    while(*s) TX2_write2buff(*s++);
+}
+
+static void dbg_u16(unsigned int v)
+{
+    char buf[6];
+    unsigned char i=0,j;
+    if(v==0){TX2_write2buff('0');return;}
+    while(v>0&&i<5){buf[i++]='0'+(v%10);v/=10;}
+    for(j=0;j<i;j++) TX2_write2buff(buf[i-1-j]);
+}
+
+static void dbg_state(void)
+{
+    dbg_puts("DBG A=");
+    dbg_u16(module_addr);
+    dbg_puts(" S=");
+    dbg_u16((unsigned int)current_state);
+    dbg_puts(" OC=");
+    dbg_u16((unsigned int)alarmOvercharge);
+    dbg_puts(" OD=");
+    dbg_u16((unsigned int)alarmOverdischarge);
+    dbg_puts(" V=");
+    dbg_u16(curBatVolt);
+    dbg_puts(" IC=");
+    dbg_u16(curChargeCurrentMA);
+    dbg_puts(" ID=");
+    dbg_u16(curDischargeCurrentMA);
+    dbg_puts(" QC=");
+    dbg_u16(curChargeMAH);
+    dbg_puts(" QD=");
+    dbg_u16(curDischargeMAH);
+    dbg_puts("\r\n");
+}
+
+static void dbg_poll(void)
+{
+    static unsigned long last=0;
+    unsigned long now=TimeStamp_GetTick();
+    if((now-last)>=1000UL){last=now;dbg_state();}
+}
+#endif
+
 static void bat_process(void)
 {
     {static u8 d=0;if(++d>=10){d=0;Capacity_Update();}}
@@ -251,6 +299,25 @@ void UART_config(void)
     UART1_SW(UART1_SW_P30_P31);
 }
 
+#if EXECUTOR_DEBUG_UART
+void DebugUART_config(void)
+{
+    COMx_InitDefine COMx_InitStructure;
+    GPIO_InitTypeDef GPIO_InitStructure;
+    GPIO_InitStructure.Pin=GPIO_Pin_6|GPIO_Pin_7;
+    GPIO_InitStructure.Mode=GPIO_PullUp;
+    GPIO_Inilize(GPIO_P4,&GPIO_InitStructure);
+    UART2_SW(UART2_SW_P46_P47);
+    COMx_InitStructure.UART_Mode=UART_8bit_BRTx;
+    COMx_InitStructure.UART_BRT_Use=BRT_Timer2;
+    COMx_InitStructure.UART_BaudRate=256000ul;
+    COMx_InitStructure.UART_RxEnable=DISABLE;
+    COMx_InitStructure.BaudRateDouble=DISABLE;
+    UART_Configuration(UART2,&COMx_InitStructure);
+    NVIC_UART2_Init(ENABLE,Priority_0);
+}
+#endif
+
 void XOSC_Init(void){P_SW2|=0x80;XOSCCR=0xC0;while(!(XOSCCR&0x01));CLKDIV=0x00;CLKSEL=0x01;}
 
 void SetChargeParamsByBatteryType(void){switch(batteryType){case 0:CHG_VOLT_SET_1=0;CHG_VOLT_SET_2=0;chargeCurrentSet=100;overchargeProtectVolt=21500;overdischargeProtectVolt=12000;break;case 1:CHG_VOLT_SET_1=1;CHG_VOLT_SET_2=1;chargeCurrentSet=50;overchargeProtectVolt=17500;overdischargeProtectVolt=10000;break;case 2:CHG_VOLT_SET_1=1;CHG_VOLT_SET_2=1;chargeCurrentSet=50;overchargeProtectVolt=15000;overdischargeProtectVolt=8500;break;}}
@@ -272,9 +339,15 @@ void main(void)
     module_addr=get_hw_addr();
     I2C_config();
     UART_config();
+#if EXECUTOR_DEBUG_UART
+    DebugUART_config();
+#endif
     EA=1;
     printf("MBON\r\n");
     ADC_config();TimeStamp_Init();Capacity_Init();
+#if EXECUTOR_DEBUG_UART
+    dbg_puts("DBG BOOT\r\n");
+#endif
 
     while(1)
     {
@@ -288,6 +361,9 @@ void main(void)
             }
         }
         bat_process();  /* 电池管理 */
+#if EXECUTOR_DEBUG_UART
+        dbg_poll();
+#endif
     }
 }
 
