@@ -68,6 +68,8 @@ STAGE_COMPLETED = 4
 DATA_STALE_RETRY_SEC = 10
 DATA_STALE_ABORT_SEC = 60
 NO_PROGRESS_ABORT_SEC = 30 * 60
+STAGE_HARD_ABORT_SEC = 12 * 60 * 60
+TEST_START_FRESH_SEC = 5
 
 CURRENT_THRESHOLD = 50  # mA
 
@@ -1355,24 +1357,37 @@ class MainWindow(QMainWindow):
         from datetime import datetime as _dt
         import os
         savedir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '测试数据')
-        os.makedirs(savedir, exist_ok=True)
-        fn = _dt.now().strftime('autosave_%Y%m%d_%H%M%S.csv')
-        self._auto_save_path = os.path.join(savedir, fn)
-        self._auto_save_file = open(self._auto_save_path, 'w', encoding='utf-8-sig')
-        self._auto_save_file.write('时间,模块编号,地址,类型,容量mAh,循环\n')
-        self._auto_save_file.flush()
-        self.on_log_message('Auto-save started: ' + fn, 'info')
+        try:
+            os.makedirs(savedir, exist_ok=True)
+            fn = _dt.now().strftime('autosave_%Y%m%d_%H%M%S.csv')
+            self._auto_save_path = os.path.join(savedir, fn)
+            self._auto_save_file = open(self._auto_save_path, 'w', encoding='utf-8-sig')
+            self._auto_save_file.write('时间,模块编号,地址,类型,容量mAh,循环\n')
+            self._auto_save_file.flush()
+            os.fsync(self._auto_save_file.fileno())
+            self.on_log_message('Auto-save started: ' + fn, 'info')
+            return True
+        except Exception as e:
+            self._auto_save_file = None
+            self.on_log_message('Auto-save start failed: ' + str(e), 'error')
+            QMessageBox.critical(self, tr('error'), 'Auto-save start failed: ' + str(e))
+            return False
 
     def _stop_auto_save(self):
         if self._auto_save_file:
-            self._auto_save_file.close()
+            try:
+                self._auto_save_file.flush()
+                self._auto_save_file.close()
+            except Exception as e:
+                self.on_log_message('Auto-save close error: ' + str(e), 'error')
             self._auto_save_file = None
             self.on_log_message('Auto-save stopped: ' + (self._auto_save_path or ''), 'info')
 
     def _write_save_line(self, module_idx, field, value, voltage=None):
-        if value <= 0 or not self._auto_save_file:
+        if (value <= 0 and not str(field).startswith('fail')) or not self._auto_save_file:
             return
         from datetime import datetime as _dt
+        import os
         addr = MODULE_ADDRS[module_idx]
         recs = self.cycle_records[module_idx]
         cycle_num = len(recs)
@@ -1381,6 +1396,7 @@ class MainWindow(QMainWindow):
         try:
             self._auto_save_file.write(line)
             self._auto_save_file.flush()
+            os.fsync(self._auto_save_file.fileno())
         except Exception as e:
             self.on_log_message('Auto-save write error: ' + str(e), 'error')
 
@@ -1412,6 +1428,15 @@ class MainWindow(QMainWindow):
         state.stage_start_time = now
         state.last_progress_time = now
         state.last_retry_time = 0
+
+    def _is_module_fresh(self, idx, max_age=TEST_START_FRESH_SEC):
+        last_seen = self.module_last_seen[idx] if 0 <= idx < MODULE_COUNT else 0
+        if not last_seen:
+            return False
+        return (time.time() - last_seen) <= max_age
+
+    def _fresh_online_modules(self):
+        return sorted(idx for idx in self.online_modules if self._is_module_fresh(idx))
 
     def send_command_reliable(self, cmd, addr, data=None):
         """Non-blocking send: fire-and-forget + optional retry via timer."""
@@ -1452,7 +1477,12 @@ class MainWindow(QMainWindow):
         self.send_command_reliable(CMD_STOP_DISCHARGE, addr)
         state.completed = True
         state.result = reason
-        self.global_test_results[idx] = {'result': reason, 'discharge': 0, 'charge2': 0}
+        self.global_test_results[idx] = {
+            'result': reason,
+            'discharge': getattr(state, 'discharge_cap', 0),
+            'charge2': getattr(state, 'charge2_cap', 0)
+        }
+        self._write_save_line(idx, 'fail_' + str(reason).replace(',', ';'), 0)
         self.check_all_completed()
         self.on_log_message(tr('abort_test_reason', addr, reason), "error")
 
@@ -1837,7 +1867,11 @@ class MainWindow(QMainWindow):
         for mod in modules:
             if mod is None:
                 continue
-            idx = MODULE_ADDRS.index(mod['addr'])
+            addr = mod.get('addr')
+            if addr not in MODULE_ADDRS:
+                self.on_log_message("DROP invalid module addr: %s" % addr, "error")
+                continue
+            idx = MODULE_ADDRS.index(addr)
             self.modules_data[idx] = mod
 
             curr_status = mod['status']
@@ -1896,19 +1930,27 @@ class MainWindow(QMainWindow):
                 state = self.module_test_states.get(idx)
                 if isinstance(state, LoopModuleState) and not state.completed:
                     mod = modules[idx] if 0 <= idx < len(modules) else None
-                    if mod:
-                        self.update_loop_state(idx, state, mod)
-                    else:
-                        self._handle_stale_state(idx, state)
+                    try:
+                        if mod:
+                            self.update_loop_state(idx, state, mod)
+                        else:
+                            self._handle_stale_state(idx, state)
+                    except Exception as e:
+                        self.on_log_message("STATE ERROR[%#04x] %s" % (MODULE_ADDRS[idx], e), "error")
+                        self._abort_state_as_failed(idx, state, "state exception")
         else:
             for idx in list(self.module_test_states.keys()):
                 state = self.module_test_states.get(idx)
                 if isinstance(state, ModuleTestState) and not state.completed:
                     mod = modules[idx] if 0 <= idx < len(modules) else None
-                    if mod:
-                        self.update_module_test_state(idx, state, mod)
-                    else:
-                        self._handle_stale_state(idx, state)
+                    try:
+                        if mod:
+                            self.update_module_test_state(idx, state, mod)
+                        else:
+                            self._handle_stale_state(idx, state)
+                    except Exception as e:
+                        self.on_log_message("STATE ERROR[%#04x] %s" % (MODULE_ADDRS[idx], e), "error")
+                        self._abort_state_as_failed(idx, state, "state exception")
 
         self.update_table()
 
@@ -1918,6 +1960,8 @@ class MainWindow(QMainWindow):
         status = mod['status']
         addr = MODULE_ADDRS[idx]
         now = time.time()
+        if self._check_state_deadline(idx, state, now):
+            return
 
         # --- Alarm handling with retry ---
         # Overcharge during charging: stop and retry after cooldown
@@ -1959,11 +2003,13 @@ class MainWindow(QMainWindow):
             if not getattr(state, 'alarm_nb_logged', False):
                 state.alarm_nb_logged = True
                 self.on_log_message("ALARM: %#04x no-battery | cycle %d/%d" % (addr, state.current_cycle+1, state.total_cycles), "error")
+            self._abort_state_as_failed(idx, state, "no battery")
+            return
         else:
             state.alarm_nb_logged = False
 
         # --- Discharge stall recovery: module in DISCHARGE stage but not discharging ---
-        if state.stage == STAGE_DISCHARGE and not (status & 0x02):
+        if state.stage == STAGE_DISCHARGE and not (status & 0x02) and not (status & 0x20):
             elapsed = now - state.stage_start_time
             if elapsed > 3.0:
                 self.on_log_message("WARN: %#04x DISCHARGE stage but not discharging (%.1fs), retry cmd" % (addr, elapsed), "error")
@@ -2072,8 +2118,8 @@ class MainWindow(QMainWindow):
         if state is None or state.completed:
             return
         now = time.time()
-        last_seen = self.module_last_seen[idx] or 0
-        if last_seen and now - last_seen >= DATA_STALE_RETRY_SEC:
+        last_seen = self.module_last_seen[idx] or state.stage_start_time
+        if now - last_seen >= DATA_STALE_RETRY_SEC:
             self._handle_stale_state(idx, state)
             return
         mod = self.modules_data[idx]
@@ -2120,6 +2166,8 @@ class MainWindow(QMainWindow):
         lower = state.lower_limit
         upper = state.upper_limit
         now = time.time()
+        if self._check_state_deadline(idx, state, now):
+            return
 
         if status & 0x04:
             self.on_log_message(tr('alarm_overcharge', addr), "error")
@@ -2127,6 +2175,10 @@ class MainWindow(QMainWindow):
             return
         if status & 0x08:
             self.on_log_message(tr('alarm_overdischarge', addr), "error")
+            self.abort_module_test(idx, state, 'NG')
+            return
+        if status & 0x40:
+            self.on_log_message("ALARM: %#04x no-battery during test" % addr, "error")
             self.abort_module_test(idx, state, 'NG')
             return
 
@@ -2197,6 +2249,7 @@ class MainWindow(QMainWindow):
                 self.send_command_reliable(CMD_START_CHARGE, addr)
                 state.charge2_start = 0  # STC8H resets on start
                 state.charge2_max = 0  # STC8H resets on start
+                state.charge2_empty_retries = 0
                 self.on_log_message(tr('discharge_done', addr, discharged), "info")
                 return
             elif state._dchg_stable >= PMT_THRESH and mod['discharge_mah'] > 200 and now - state.stage_start_time > 30:
@@ -2211,6 +2264,7 @@ class MainWindow(QMainWindow):
                 self.send_command_reliable(CMD_START_CHARGE, addr)
                 state.charge2_start = 0
                 state.charge2_max = 0
+                state.charge2_empty_retries = 0
                 state._chg_stable = 0
                 self.on_log_message(tr('discharge_done', addr, discharged), "info")
                 return
@@ -2221,7 +2275,12 @@ class MainWindow(QMainWindow):
                 time.sleep(0.05)
                 charged = state.charge2_max - state.charge2_start
                 if charged < 1:
+                    retries = getattr(state, 'charge2_empty_retries', 0) + 1
+                    state.charge2_empty_retries = retries
                     self.on_log_message(tr('charge2_empty_retry', addr), "error")
+                    if retries >= 3:
+                        self.abort_module_test(idx, state, 'NG')
+                        return
                     self.send_command_reliable(CMD_START_CHARGE, addr)
                     return
                 state.charge2_cap = charged
@@ -2339,7 +2398,8 @@ class MainWindow(QMainWindow):
         if self.test_running:
             QMessageBox.warning(self, tr('warning'), tr('test_running'))
             return
-        if not self.online_modules:
+        fresh_modules = self._fresh_online_modules()
+        if not fresh_modules:
             QMessageBox.warning(self, tr('warning'), tr('no_online_modules'))
             return
         self.cycle_records = [[] for _ in range(MODULE_COUNT)]
@@ -2352,7 +2412,7 @@ class MainWindow(QMainWindow):
         lower = self.lower_limit_spin.value()
         upper = self.upper_limit_spin.value()
         reply = QMessageBox.question(self, tr('confirm'),
-                                     tr('confirm_start_global_test', len(self.online_modules), lower, upper),
+                                     tr('confirm_start_global_test', len(fresh_modules), lower, upper),
                                      QMessageBox.Yes | QMessageBox.No)
         if reply != QMessageBox.Yes:
             return
@@ -2362,7 +2422,7 @@ class MainWindow(QMainWindow):
         self.module_test_states.clear()
         self.global_test_results = [None] * MODULE_COUNT
 
-        self._global_test_modules = list(self.online_modules)
+        self._global_test_modules = fresh_modules
         for idx in self._global_test_modules:
             mod = self.modules_data[idx]
             if mod is None:
@@ -2370,7 +2430,15 @@ class MainWindow(QMainWindow):
             state = ModuleTestState(idx, lower, upper)
             state.start(mod['charge_mah'], mod['discharge_mah'])
             self.module_test_states[idx] = state
+        if not self.module_test_states:
+            self.test_running = False
+            self.global_test_mode = False
+            QMessageBox.warning(self, tr('warning'), tr('no_online_modules'))
+            return
 
+        if not self._start_auto_save():
+            self.stop_test(reset_ui=True)
+            return
         self.serial_thread.send_all_command(CMD_ALL_EMERGENCY_STOP)
         QTimer.singleShot(200, lambda: self.serial_thread.send_all_command(CMD_ALL_START_CHARGE))
 
@@ -2384,7 +2452,6 @@ class MainWindow(QMainWindow):
         self.test_status_label.setText(tr('test_running_global'))
         self.watchdog_timer.start(3000)
         self.on_log_message(tr('global_test_started', len(self.module_test_states)), "info")
-        self._start_auto_save()
 
     def on_start_test(self):
         self.cycle_records = [[] for _ in range(MODULE_COUNT)]
@@ -2406,7 +2473,7 @@ class MainWindow(QMainWindow):
 
         idx = self.module_combo.currentIndex()
         addr = MODULE_ADDRS[idx]
-        if self.modules_data[idx] is None:
+        if self.modules_data[idx] is None or not self._is_module_fresh(idx):
             QMessageBox.warning(self, tr('warning'), tr('module_no_data', addr))
             return
 
@@ -2427,6 +2494,9 @@ class MainWindow(QMainWindow):
         state.start(mod['charge_mah'], mod['discharge_mah'])
         self.module_test_states[idx] = state
 
+        if not self._start_auto_save():
+            self.stop_test(reset_ui=True)
+            return
         self.serial_thread.send_command(CMD_STOP_CHARGE, addr)
         self.serial_thread.send_command(CMD_STOP_DISCHARGE, addr)
         QTimer.singleShot(200, lambda: self.serial_thread.send_command(CMD_START_CHARGE, addr))
@@ -2439,7 +2509,6 @@ class MainWindow(QMainWindow):
         self.btn_global_test.setEnabled(False)
         self.btn_loop_test.setEnabled(False)
         self.on_log_message(tr('single_test_started', addr), "info")
-        self._start_auto_save()
 
     def on_stop_test_clicked(self):
         if self.test_running:
@@ -2455,7 +2524,8 @@ class MainWindow(QMainWindow):
         if self.test_running:
             QMessageBox.warning(self, tr('warning'), tr('test_running'))
             return
-        if not self.online_modules:
+        fresh_modules = self._fresh_online_modules()
+        if not fresh_modules:
             QMessageBox.warning(self, tr('warning'), tr('no_online_modules'))
             return
 
@@ -2465,7 +2535,7 @@ class MainWindow(QMainWindow):
             return
 
         reply = QMessageBox.question(self, tr('confirm'),
-                                     tr('confirm_start_loop', len(self.online_modules), total),
+                                     tr('confirm_start_loop', len(fresh_modules), total),
                                      QMessageBox.Yes | QMessageBox.No)
         if reply != QMessageBox.Yes:
             return
@@ -2484,8 +2554,7 @@ class MainWindow(QMainWindow):
         self._peak_dchg_mah = [0] * MODULE_COUNT
 
         # Snapshot online modules at loop start
-        self._loop_start_modules = list(self.online_modules)
-        self._start_auto_save()
+        self._loop_start_modules = fresh_modules
         self.module_test_states.clear()
         for idx in self._loop_start_modules:
             mod = self.modules_data[idx]
@@ -2494,6 +2563,16 @@ class MainWindow(QMainWindow):
             state = LoopModuleState(idx, total)
             state.start(mod['charge_mah'], mod['discharge_mah'])
             self.module_test_states[idx] = state
+        if not self.module_test_states:
+            self.loop_test_active = False
+            self.test_running = False
+            self.global_test_mode = False
+            self._stop_auto_save()
+            QMessageBox.warning(self, tr('warning'), tr('no_online_modules'))
+            return
+        if not self._start_auto_save():
+            self.stop_loop_test(final_stop=False)
+            return
 
         self.serial_thread.send_all_command(CMD_ALL_EMERGENCY_STOP)
         QTimer.singleShot(200, lambda: self.serial_thread.send_all_command(CMD_ALL_START_CHARGE))
@@ -2536,7 +2615,7 @@ class MainWindow(QMainWindow):
         self.on_log_message(f"Starting loop cycle {self.loop_current_cycle}/{self.loop_total_cycles}", "info")
 
         # Snapshot online modules at cycle start to avoid mid-cycle drops
-        cycle_modules = list(self.online_modules)
+        cycle_modules = self._fresh_online_modules()
         if not cycle_modules:
             self.on_log_message("WARNING: no online modules at cycle start, aborting loop", "error")
             self.stop_loop_test(final_stop=True)
@@ -2655,8 +2734,25 @@ class MainWindow(QMainWindow):
             self.abort_module_test(idx, state, 'NG')
         else:
             state.completed = True
+            self.global_test_results[idx] = {'result': 'NG', 'discharge': getattr(state, 'discharge_max', 0), 'charge2': getattr(state, 'charge_max', 0)}
+            self._write_save_line(idx, 'fail_' + str(reason).replace(',', ';'), 0)
             self.on_log_message("ABORT[%#04x] %s" % (addr, reason), "error")
             self.check_loop_all_completed()
+
+    def _check_state_deadline(self, idx, state, now=None):
+        if state.completed:
+            return False
+        if now is None:
+            now = time.time()
+        no_progress_sec = now - getattr(state, 'last_progress_time', state.stage_start_time)
+        stage_sec = now - state.stage_start_time
+        if no_progress_sec >= NO_PROGRESS_ABORT_SEC:
+            self._abort_state_as_failed(idx, state, "no capacity progress for %.0fs" % no_progress_sec)
+            return True
+        if stage_sec >= STAGE_HARD_ABORT_SEC:
+            self._abort_state_as_failed(idx, state, "stage timeout for %.0fs" % stage_sec)
+            return True
+        return False
 
     def _stage_start_command(self, stage):
         if stage == STAGE_CHARGE1 or stage == STAGE_CHARGE2:
@@ -2677,10 +2773,8 @@ class MainWindow(QMainWindow):
 
         last_seen = self.module_last_seen[idx] or state.stage_start_time
         stale_sec = now - last_seen
-        no_progress_sec = now - state.last_progress_time
 
-        if no_progress_sec >= NO_PROGRESS_ABORT_SEC:
-            self._abort_state_as_failed(idx, state, "no capacity progress for %.0fs" % no_progress_sec)
+        if self._check_state_deadline(idx, state, now):
             return
 
         if stale_sec < DATA_STALE_RETRY_SEC:
@@ -2712,15 +2806,14 @@ class MainWindow(QMainWindow):
             if state.completed:
                 continue
             mod = self.modules_data[idx]
-            last_seen = self.module_last_seen[idx] or 0
-            if mod is None or (last_seen and now - last_seen >= DATA_STALE_RETRY_SEC):
+            last_seen = self.module_last_seen[idx] or state.stage_start_time
+            if mod is None or now - last_seen >= DATA_STALE_RETRY_SEC:
                 self._handle_stale_state(idx, state)
                 continue
             addr = MODULE_ADDRS[idx]
             status = mod['status']
             elapsed = now - state.stage_start_time
-            if now - getattr(state, 'last_progress_time', state.stage_start_time) >= NO_PROGRESS_ABORT_SEC:
-                self._abort_state_as_failed(idx, state, "no capacity progress")
+            if self._check_state_deadline(idx, state, now):
                 continue
 
             if (state.stage == STAGE_CHARGE1 or state.stage == STAGE_CHARGE2):

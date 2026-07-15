@@ -168,7 +168,9 @@ class ProtocolThread(QThread):
 
             resp = self._read_reply_nonblocking(27, POLL_READ_TIMEOUT_SEC)
 
-            if len(resp) < 27 or resp[2] != RESP_OK: return None
+            if len(resp) < 27: return None
+            if resp[0] != addr or resp[1] != (CMD_BATCH_READ | 0x80): return None
+            if resp[2] != RESP_OK or resp[3] != 22: return None
             if xor_checksum(resp[:-1]) != resp[-1]: return None
             return struct.unpack('>11H', resp[4:26])
         except Exception:
@@ -199,7 +201,7 @@ class ProtocolThread(QThread):
 
     def send_command_sync(self, cmd_code, addr, data=None, timeout_ms=300):
         """Queue command and wait for the bridge status. Returns 0=OK, 0xFF=fail, -1=timeout/unavailable."""
-        if self._s is None or not self._s.is_open:
+        if not self.running or self._s is None or not self._s.is_open:
             return -1
         m = _OLD_CMD_MAP.get(cmd_code, cmd_code)
         done = threading.Event()
