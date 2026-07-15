@@ -31,7 +31,7 @@
           <bCustSvd>0</bCustSvd>
           <UseEnv>0</UseEnv>
           <BinPath></BinPath>
-          <IncludePath>.\src;..\protocol</IncludePath>
+          <IncludePath>.\src;.\bridge</IncludePath>
           <LibPath></LibPath>
           <RegisterFilePath>STC\</RegisterFilePath>
           <DBRegisterFilePath>STC\</DBRegisterFilePath>
@@ -321,7 +321,7 @@
               <MiscControls></MiscControls>
               <Define></Define>
               <Undefine></Undefine>
-              <IncludePath>.\src;..\protocol</IncludePath>
+              <IncludePath>.\src;.\bridge</IncludePath>
             </VariousControls>
           </C51>
           <Ax51>
@@ -333,7 +333,7 @@
               <MiscControls></MiscControls>
               <Define></Define>
               <Undefine></Undefine>
-              <IncludePath>.\src;..\protocol</IncludePath>
+              <IncludePath>.\src;.\bridge</IncludePath>
             </VariousControls>
           </Ax51>
           <Lx51>
@@ -376,12 +376,12 @@
             <File>
               <FileName>bridge_main.c</FileName>
               <FileType>1</FileType>
-              <FilePath>..\protocol\main.c</FilePath>
+              <FilePath>.\bridge\main.c</FilePath>
             </File>
             <File>
               <FileName>protocol.c</FileName>
               <FileType>1</FileType>
-              <FilePath>..\protocol\protocol.c</FilePath>
+              <FilePath>.\bridge\protocol.c</FilePath>
             </File>
             <File>
               <FileName>STC8G_H_Delay.c</FileName>

@@ -1,8 +1,0 @@
-Build target 'Target 1'
-compiling main.c...
-main.c(614): error C172: 'case': missing enclosing switch
-main.c(626): error C172: 'case': missing enclosing switch
-main.c(639): error C172: 'default': missing enclosing switch
-main.c(679): error C141: syntax error near '}', expected 'hdata'
-Target not created.
-Build Time Elapsed:  00:00:00
