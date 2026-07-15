@@ -1,0 +1,1 @@
+/* Placeholder - all definitions now in protocol.h */

@@ -1,0 +1,18 @@
+{
+  "baudrate": "256000",
+  "last_port": "",
+  "language": "zh",
+  "window_width": 1250,
+  "window_height": 850,
+  "lower_limit": 1800,
+  "upper_limit": 2200,
+  "default_cycles": 10,
+  "batch_interval_ms": 300,
+  "low_voltage_threshold": 3000,
+  "activation_duration_ms": 50,
+  "activation_wait_ms": 1000,
+  "activation_check_ms": 5000,
+  "no_battery_retry_ms": 30000,
+  "i2c_clock_hz": 400000,
+  "buzzer_duration_ms": 500
+}

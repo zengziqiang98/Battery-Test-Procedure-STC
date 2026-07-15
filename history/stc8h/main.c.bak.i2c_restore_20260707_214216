@@ -1,0 +1,719 @@
+#include "config.h"
+#include "string.h"
+#include "STC8G_H_GPIO.h"
+//#include "STC8G_H_I2C.h"  // 已替换为Modbus RTU
+#include "modbus_slave.h"
+#include "STC8G_H_Soft_I2C.h"
+#include "STC8G_H_Timer.h"
+#include "STC8G_H_UART.h"
+#include "STC8G_H_NVIC.h"
+#include "STC8G_H_Switch.h"
+#include "i2c_cmd.h"
+#include "capacity.h"
+#include "STC8G_H_UART.h"
+#include "STC8H_PWM.h"
+
+
+// 过充/过放延时确认时间（毫秒）
+
+// ---------- 无电池检测阈值 ----------
+#define NO_BAT_VOLT_THRESHOLD   5000    // 低于5V判定无电池
+#define NO_BAT_CURR_THRESHOLD   300     // 低于300mA判定无电池
+#define NO_BAT_CHECK_TIMEOUT_MS 10000   // 自检超时10秒
+#define OVER_VOLT_CONFIRM_MS   50000   // 过充确认延时2秒
+#define UNDER_VOLT_CONFIRM_MS  50000   // 过放确认延时2秒
+
+// 充电过充延时确认状态
+static unsigned long chg_overc_wait_start_tick = 0;
+static unsigned char  chg_overc_waiting = 0;      // 0:未等待 1:正在等待确认过充
+
+// 放电过放延时确认状态
+static unsigned long dischg_overd_wait_start_tick = 0;
+static unsigned char  dischg_overd_waiting = 0;    // 0:未等待 1:正在等待确认过放
+	
+// ---------- 内部变量 ----------
+// 充电完成确认 (3秒消抖)
+#define CHG_COMPLETE_CONFIRM_MS  30000
+#define DISCHG_COMPLETE_CONFIRM_MS 30000
+
+unsigned long xdata chg_complete_wait_start_tick = 0;
+unsigned char xdata chg_complete_waiting = 0;
+
+// 放电完成确认 (3秒消抖)
+unsigned long xdata dischg_complete_wait_start_tick = 0;
+unsigned char xdata dischg_complete_waiting = 0;
+
+// UART 帧超时恢复 (1秒)
+xdata unsigned int curChargeMAH;            // 当前充电mAh
+xdata unsigned int curDischargeMAH;         // 当前放电mAh
+xdata unsigned int curBatVolt;              // 当前电池电压(mV)
+xdata unsigned int overchargeProtectVolt;   // 设置的过充保护电压
+xdata unsigned int overdischargeProtectVolt;// 设置的过放保护电压
+xdata unsigned int readOverchargeProtectVolt;  // 实测过充保护电压
+xdata unsigned int readOverdischargeProtectVolt; // 实测过放保护电压
+xdata unsigned char cycleDischargeNum;        // 写入的循环放电次数
+xdata unsigned char curCycleNum;              // 当前循环次数
+xdata unsigned int cycleDischargeEndMAH[10]; // 10次放电结束mAh
+xdata unsigned int cycleChargeEndMAH[10];   // 10次充电结束mAh
+xdata unsigned char alarmOvercharge;          // 过充报警位 (bit0)
+xdata unsigned char alarmOverdischarge;       // 过放报警位 (bit0)
+xdata unsigned char chargeVoltSet;            // 充电电压设置
+xdata unsigned char chargeCurrentSet;         // 充电电流设置
+xdata unsigned char batteryType;              // 电池类型
+xdata unsigned int curChargeCurrentMA;
+xdata unsigned int curDischargeCurrentMA;
+
+// ---------- I2C从机状态控制 ----------
+xdata unsigned char i2c_cmd;                  // 当前接收的命令
+xdata unsigned char i2c_rx_len;               // 需要接收的数据长度（0/1/2）
+xdata unsigned char i2c_rx_index;              // 已接收字节数
+xdata unsigned char i2c_rx_buf[2];             // 接收数据缓冲区
+xdata unsigned char i2c_tx_len;                // 待发送数据长度
+xdata unsigned char i2c_tx_index;              // 已发送字节数
+xdata unsigned char i2c_tx_buf[3];             // 发送缓冲区
+bit i2c_pending_read;              // 等待读请求标志
+
+// ---------- I2C从机请求标志 ----------
+bit start_discharge_req = 0;
+bit stop_discharge_req  = 0;
+bit start_charge_req    = 0;
+bit stop_charge_req     = 0;
+
+
+
+
+unsigned long charge_start_tick;   // 进入充电状态时的 tick
+unsigned long discharge_start_tick; // 进入放电状态时的 tick
+
+unsigned long init_check_tick = 0; // 自检开始tick
+bit init_check_done = 0;       // 开机自检完成
+bit no_battery_flag = 0;       // 无电池标志
+unsigned int CHG_CURRENT_SET_Pwm;
+
+unsigned char init_check_phase = 0;    // 自检阶段: 0=放电, 1=充电
+
+char data_dat = 0;
+// ---------- 状态机 ----------
+typedef enum {
+    STATE_IDLE,
+    STATE_CHARGING,
+    STATE_DISCHARGING,
+    STATE_CHARGE_COMPLETE,   // 充电完成（电流<10mA），准备切放电
+    STATE_DISCHARGE_COMPLETE,// 放电完成，电流<10mA，准备进行充电
+    STATE_NO_BATTERY,           // 确认无电池-保持放电等待电池插入
+    STATE_INIT_CHECK            // 开机自检-短时充放电检测
+} SystemState;
+
+xdata SystemState current_state = STATE_IDLE;
+xdata unsigned int charge_start_mah = 0;     // 本次充电起始容量
+xdata unsigned int discharge_start_mah = 0;  // 本次放电起始容量
+
+static unsigned long last_print_tick = 0; 
+
+// ---------- 函数声明 ----------
+void I2C_config(void);
+void GPIO_config(void);
+void ADC_config(void);
+// 电流阈值（10mA）
+#define CURRENT_THRESHOLD_MA   10
+#define CURRENT_THRESHOLD_A    0.01f
+
+// 函数声明
+//void I2C_Init(void);
+//void I2C_Isr(void) interrupt 24;  // STC8H I2C中断号一般为24，请参考具体型号
+
+PWMx_Duty PWMA_Duty;
+// ---------- 初始化I2C从机 ----------
+void delay_ms(unsigned int ms)
+{
+    unsigned long start = TimeStamp_GetTick();
+    unsigned long target = (unsigned long)ms * 10;  // 1ms = 10 × 100us
+    while ((TimeStamp_GetTick() - start) < target);
+}
+void SetChargeParamsByBatteryType(void)
+{
+    // 假设 batteryType 由主机通过 I2C 命令 CMD_SET_BAT_TYPE 写入
+    // 具体映射规则需根据实际电池规格定义，以下为示例：
+    switch (batteryType) {
+        case 0: // 五节三元
+            CHG_VOLT_SET_1 = 0;
+            CHG_VOLT_SET_2 = 0;   // 假设00对应4.2V
+            CHG_CURRENT_SET_Pwm = 100;   // PWM100%，放电1000mA
+						PWMA_Duty.PWM1_Duty = 24000;
+						overchargeProtectVolt = 22500;
+						overdischargeProtectVolt = 12000;
+						UpdatePwm(PWMA, &PWMA_Duty);
+            break;
+        case 1: // 四节三元
+            CHG_VOLT_SET_1 = 1;
+            CHG_VOLT_SET_2 = 1;   // 假设10对应4.35V
+            CHG_CURRENT_SET_Pwm = 50;   // 占空比50%，放电500mA
+						PWMA_Duty.PWM1_Duty = 6000;
+						overchargeProtectVolt = 18500;
+						overdischargeProtectVolt = 9500;
+						UpdatePwm(PWMA, &PWMA_Duty);
+            break;
+        case 2: // 四节铁锂电池
+            CHG_VOLT_SET_1 = 1;
+            CHG_VOLT_SET_2 = 1;   // 假设10对应4.35V
+            CHG_CURRENT_SET_Pwm = 50;   // 占空比50%，放电500mA
+						PWMA_Duty.PWM1_Duty = 6000;
+						overchargeProtectVolt = 15500;
+						overdischargeProtectVolt = 8000;
+						UpdatePwm(PWMA, &PWMA_Duty);
+            break;
+        default:
+            CHG_VOLT_SET_1 = 0;
+            CHG_VOLT_SET_2 = 0;
+            CHG_CURRENT_SET = 1;
+            break;
+    }
+    // 注意：实际硬件需要足够时间稳定，可能需短暂延时
+}
+
+void	PWM_config(void)
+{
+	PWMx_InitDefine		PWMx_InitStructure;
+	
+	PWMx_InitStructure.PWM_Mode    =	CCMRn_PWM_MODE1;	//模式,		CCMRn_FREEZE,CCMRn_MATCH_VALID,CCMRn_MATCH_INVALID,CCMRn_ROLLOVER,CCMRn_FORCE_INVALID,CCMRn_FORCE_VALID,CCMRn_PWM_MODE1,CCMRn_PWM_MODE2
+	PWMx_InitStructure.PWM_Duty    = 1200;	//PWM占空比时间, 0~Period
+	PWMx_InitStructure.PWM_EnoSelect   =  ENO1N;	//输出通道选择,	ENO1P,ENO1N,ENO2P,ENO2N,ENO3P,ENO3N,ENO4P,ENO4N / ENO5P,ENO6P,ENO7P,ENO8P
+	PWM_Configuration(PWM1, &PWMx_InitStructure);			//初始化PWM,  PWMA,PWMB
+
+	PWMx_InitStructure.PWM_Period   = 24000;					//周期时间,   0~65535
+	PWMx_InitStructure.PWM_DeadTime = 0;					//死区发生器设置, 0~255
+	PWMx_InitStructure.PWM_MainOutEnable= ENABLE;			//主输出使能, ENABLE,DISABLE
+	PWMx_InitStructure.PWM_CEN_Enable   = ENABLE;			//使能计数器, ENABLE,DISABLE
+	PWM_Configuration(PWMA, &PWMx_InitStructure);			//初始化PWM通用寄存器,  PWMA,PWMB
+
+	PWM1_SW(PWM1_SW_P20_P21);			//PWM1_SW_P10_P11,PWM1_SW_P20_P21,PWM1_SW_P60_P61
+
+
+	NVIC_PWM_Init(PWMA,DISABLE,Priority_0);
+}
+
+void XOSC_Init() {
+    // 1. 使能访问XFR（扩展特殊功能寄存器）
+    P_SW2 |= 0x80;
+    
+    // 2. 启动外部晶振（高速）
+    XOSCCR = 0xC0; // 0xC0: 使能外部晶振，无源晶振模式
+    // 如果使用32.768KHz低速晶振，应使用：X32KCR = 0x80 + 0x40; // 启动+高增益
+    // 2.1 等待时钟稳定
+    while (!(XOSCCR & 0x01)); // 等待XOSCCR的bit0被硬件置1
+    
+    // 3. 选择外部晶振作为系统时钟源
+    CLKDIV = 0x00;    // 时钟不分频
+    CLKSEL = 0x01;    // 选择外部晶振
+    
+    // 4. 关闭内部高速IRC以省电（可选）
+    // HIRCCR &= 0x7F;
+    
+    // 恢复XFR访问权限
+//    P_SW2 &= 0x7F;
+}
+
+// ---------- 主函数 ----------
+void main(void)
+{
+	// 初始化IO
+    EAXSFR();
+		XOSC_Init();
+    // P1.0和P1.1在GPIO_config中已配置，但为确保，可再次确认
+    // 控制引脚默认低电平（关闭）
+		
+    CHARGE_CTRL = 0;
+    DISCHARGE_CTRL = 0;
+    FAN_CTRL = 0;
+	
+	//	EA = 1;
+
+    // 初始化变量
+    charge_capacity_num = 0;
+    discharge_capacity_num = 0;
+		discharge_capacity_int = 0;
+		discharge_capacity_frac = 0;
+		charge_capacity_int = 0;
+		charge_capacity_frac = 0;
+    curBatVolt = 0;
+    overchargeProtectVolt = 21000; // 默认4.2V
+    overdischargeProtectVolt = 16000;
+    readOverchargeProtectVolt = 0;
+    readOverdischargeProtectVolt = 0;
+    cycleDischargeNum = 1;          // 默认循环1次
+    curCycleNum = 0;
+    alarmOvercharge = 0;
+    alarmOverdischarge = 0;
+    memset(cycleDischargeEndMAH, 0, sizeof(cycleDischargeEndMAH));
+    memset(cycleChargeEndMAH, 0, sizeof(cycleChargeEndMAH));
+    chargeVoltSet = 0;
+    chargeCurrentSet = 0;
+    batteryType = 0;
+		charge_start_tick = 0;
+		discharge_start_tick = 0;
+		adc_bat_code = 0;
+    // 初始化外设
+		EA = 1; 
+		GPIO_config();
+		// UART_config();  // 冗余: GPIO_config + modbus_slave_init 已配置UART1
+    // I2C_config();  // 已替换为Modbus从站
+    // Modbus从站初始化: 读取IO引脚地址，复用UART1烧录口
+    {
+        unsigned char slave_addr;
+        slave_addr  = 0xC0;
+        slave_addr |= ((unsigned char)ADDR_4 << 5);
+        slave_addr |= ((unsigned char)ADDR_3 << 4);
+        slave_addr |= ((unsigned char)ADDR_2 << 3);
+        slave_addr |= ((unsigned char)ADDR_1 << 2);
+        slave_addr |= ((unsigned char)ADDR_0 << 1);
+        modbus_slave_init(slave_addr >> 1);   // 7位地址 0x60~0x7F
+    }
+    
+    ADC_config();
+
+    TimeStamp_Init();   // 启动100us定时器，用于容量积分
+    Capacity_Init();    // 容量积分初始化
+		PWM_config();
+                // 开启总中断
+		//printf   // 注释掉: Modbus模式下UART1已用作RS485通信("STC8H8K64U UART1 Test Programme!\r\n");	//UART1发送一个字符串	
+    // 主循环
+    alarmOvercharge = 0;
+    alarmOverdischarge = 0;
+    while (1)
+    {
+//			printf("cmd = %d",(int)data_dat);
+
+        // ===== 开机无电池自检 =====
+        if (!init_check_done)
+        {
+            init_check_done = 1;
+            if (current_state == STATE_IDLE)
+            {
+                // 第一步：短暂放电，看电压是否立即掉到5V以下
+                curCycleNum = 0;
+                alarmOverdischarge &= ~(ALARM_OVERDISCHARGE_BIT | ALARM_DISCHARGE_COMPLETE_BIT);
+                alarmOverdischarge |= ALARM_DISCHARGING_BIT;
+                alarmOvercharge &= ~(ALARM_OVERCHARGE_BIT | ALARM_CHARGE_COMPLETE_BIT | ALARM_CHARGING_BIT);
+                discharge_capacity_num = 0;
+                discharge_capacity_int = 0;
+                discharge_capacity_frac = 0;
+                DISCHARGE_CTRL = 1;
+                // 自检期间不转风扇
+                current_state = STATE_INIT_CHECK;
+                init_check_tick = TimeStamp_GetTick();
+                init_check_phase = 0;  // 0=放电检测, 1=充电检测
+            }
+        }
+
+				// --- Modbus从站轮询 (替代I2C + 旧UART解析器) ---
+				modbus_slave_poll();
+
+				// 处理Modbus命令 -> 转换为原有控制标志
+				if (modbus_cmd_pending) {
+					switch (modbus_cmd_code) {
+						case MB_CMD_START_DISCHARGE:
+							alarmOvercharge  &= ~ALARM_CHARGE_COMPLETE_BIT;
+							alarmOverdischarge &= ~ALARM_DISCHARGE_COMPLETE_BIT;
+							start_discharge_req = 1;
+							break;
+						case MB_CMD_STOP_DISCHARGE:
+							stop_discharge_req = 1;
+							break;
+						case MB_CMD_START_CHARGE:
+							alarmOvercharge  &= ~ALARM_CHARGE_COMPLETE_BIT;
+							alarmOverdischarge &= ~ALARM_DISCHARGE_COMPLETE_BIT;
+							start_charge_req = 1;
+							break;
+						case MB_CMD_STOP_CHARGE:
+							stop_charge_req = 1;
+							break;
+						case MB_CMD_EMERGENCY_STOP:
+							stop_charge_req = 1;
+							stop_discharge_req = 1;
+							break;
+						case MB_CMD_BUZZER_ON:
+							break;
+						case MB_CMD_BUZZER_OFF:
+							break;
+					}
+					modbus_cmd_pending = 0;
+				}
+        Capacity_Update();
+
+        // 处理停止请求（优先）
+        if (stop_discharge_req)
+        {
+            stop_discharge_req = 0;
+            if (current_state == STATE_DISCHARGING || current_state == STATE_DISCHARGE_COMPLETE)
+            {
+                DISCHARGE_CTRL = 0;
+                FAN_CTRL = 0;
+                alarmOvercharge &= ~(ALARM_CHARGING_BIT | ALARM_CHARGE_COMPLETE_BIT);
+                discharge_capacity_num = 0;
+                discharge_capacity_int = 0;
+                discharge_capacity_frac = 0;
+                alarmOvercharge = 0;
+                alarmOverdischarge = 0;
+                current_state = STATE_IDLE;
+            }
+        }
+
+        if (stop_charge_req)
+        {
+            stop_charge_req = 0;
+            if (current_state == STATE_CHARGING || current_state == STATE_CHARGE_COMPLETE)
+            {
+                CHARGE_CTRL = 0;
+                alarmOverdischarge &= ~(ALARM_DISCHARGING_BIT | ALARM_DISCHARGE_COMPLETE_BIT);
+                charge_capacity_num = 0;
+                charge_capacity_int = 0;
+                charge_capacity_frac = 0;
+                alarmOvercharge = 0;
+                alarmOverdischarge = 0;
+                current_state = STATE_IDLE;
+            }
+        }
+
+        // 处理开始请求
+        if (start_charge_req) {
+						start_charge_req = 0;
+						if (current_state == STATE_IDLE) {
+								curCycleNum = 0;
+                                // 复位充电相关报警和状态标志
+								alarmOvercharge &= ~(ALARM_OVERCHARGE_BIT | ALARM_CHARGE_COMPLETE_BIT);
+                                alarmOvercharge |= ALARM_CHARGING_BIT;   // 置位正在充电
+                                alarmOverdischarge &= ~(ALARM_OVERDISCHARGE_BIT | ALARM_DISCHARGE_COMPLETE_BIT | ALARM_DISCHARGING_BIT);
+								if (cycleDischargeNum == 0) cycleDischargeNum = 1;
+								charge_capacity_num = 0;                     // 清零累计容量
+								charge_capacity_int = 0;
+								charge_capacity_frac = 0;
+								SetChargeParamsByBatteryType();
+								CHARGE_CTRL = 1;
+								CHG_CURRENT_SET = 1;
+								current_state = STATE_CHARGING;
+								charge_start_tick = TimeStamp_GetTick();
+						}
+				}
+
+				if (start_discharge_req) {
+						start_discharge_req = 0;
+						if (current_state == STATE_IDLE) {
+								curCycleNum = 0;
+								 // 复位放电相关标志，同时清除充电相关标志（确保退出充电状态）
+                                alarmOverdischarge &= ~(ALARM_OVERDISCHARGE_BIT | ALARM_DISCHARGE_COMPLETE_BIT);
+                                alarmOverdischarge |= ALARM_DISCHARGING_BIT;
+                                alarmOvercharge &= ~(ALARM_OVERCHARGE_BIT | ALARM_CHARGE_COMPLETE_BIT | ALARM_CHARGING_BIT);
+								if (cycleDischargeNum == 0) cycleDischargeNum = 1;
+								discharge_capacity_num = 0;                  // 清零累计容量
+								discharge_capacity_int = 0;
+								discharge_capacity_frac = 0;
+								FAN_CTRL = 1;
+								DISCHARGE_CTRL = 1;
+								current_state = STATE_DISCHARGING;
+								discharge_start_tick = TimeStamp_GetTick();
+						}
+				}
+				Capacity_Update();
+        // 状态机处理
+				
+        switch (current_state)
+				{
+					case STATE_IDLE:
+							CHG_LED = 0;
+							DISCHG_LED = 0;
+							chg_overc_waiting = 0;
+							dischg_overd_waiting = 0;
+							curCycleNum = 0;
+                            alarmOvercharge &= ~ALARM_CHARGING_BIT;
+                            alarmOverdischarge &= ~ALARM_DISCHARGING_BIT;
+							memset(cycleDischargeEndMAH, 0, sizeof(cycleDischargeEndMAH));
+							memset(cycleChargeEndMAH, 0, sizeof(cycleChargeEndMAH));
+					break;
+						case STATE_CHARGING:
+									CHG_LED = 1;
+									DISCHG_LED = 0;
+
+									// 充电启动稳定期：开始后50秒内不进行过充和正常结束检测
+									if ((TimeStamp_GetTick() - charge_start_tick) < 50000) {
+											break;
+									}
+
+									// ----- 过充检测及延时确认 -----
+									if (curBatVolt >= overchargeProtectVolt && curChargeCurrentMA > 300) {
+											if (!chg_overc_waiting) {
+													// 首次检测到过充条件，开始延时确认
+													chg_overc_waiting = 1;
+													chg_overc_wait_start_tick = TimeStamp_GetTick();
+											} else {
+													// 已在等待确认，检查是否到达延时时间
+													if ((TimeStamp_GetTick() - chg_overc_wait_start_tick) >= OVER_VOLT_CONFIRM_MS) {
+															// 延时到达，再次确认条件是否仍满足
+															if (curBatVolt >= overchargeProtectVolt && curChargeCurrentMA > 300) {
+																	// 确认过充，执行保护动作
+																	 // 确认过充
+                                                                    alarmOvercharge |= ALARM_OVERCHARGE_BIT;      // 置位过充报警
+                                                                    alarmOvercharge &= ~(ALARM_CHARGING_BIT | ALARM_CHARGE_COMPLETE_BIT); // 清除正在充电和充满标志
+                                                                    alarmOverdischarge &= ~(ALARM_DISCHARGING_BIT | ALARM_DISCHARGE_COMPLETE_BIT);
+																	readOverchargeProtectVolt = curBatVolt;
+																	CHARGE_CTRL = 0;
+																	charge_capacity_num = 0;
+																	charge_capacity_int = 0;
+																	charge_capacity_frac = 0;
+																	current_state = STATE_IDLE;
+																	chg_overc_waiting = 0;
+																	break;   // 退出switch，终止本次循环
+															} else {
+																	// 假信号，清除等待标志
+																	chg_overc_waiting = 0;
+															}
+													}
+											}
+									} else {
+											// 当前不满足过充条件，若正在等待则取消等待（假信号提前消失）
+											if (chg_overc_waiting) {
+													chg_overc_waiting = 0;
+											}
+									}
+
+									// ----- // ----- 正常充电结束检测（电流 ≤ 150mA，连续3秒确认）-----
+									if (curChargeCurrentMA <= 300) {
+											if (!chg_complete_waiting) {
+													// 第一次检测，开始3秒确认
+													chg_complete_waiting = 1;
+													chg_complete_wait_start_tick = TimeStamp_GetTick();
+											} else if ((TimeStamp_GetTick() - chg_complete_wait_start_tick) >= CHG_COMPLETE_CONFIRM_MS) {
+													// 3秒确认完成
+													if (chg_overc_waiting) {
+															chg_overc_waiting = 0;
+													}
+													CHARGE_CTRL = 0;
+													cycleChargeEndMAH[curCycleNum] = curChargeMAH;
+                                            // 清除正在充电标志
+                                            alarmOvercharge &= ~ALARM_CHARGING_BIT;
+                                            alarmOvercharge |= ALARM_CHARGE_COMPLETE_BIT;
+													charge_capacity_num = 0;
+													charge_capacity_int = 0;
+													charge_capacity_frac = 0;
+													current_state = STATE_CHARGE_COMPLETE;
+													chg_complete_waiting = 0;
+											}
+									} else {
+											// 条件消失，清除等待
+											chg_complete_waiting = 0;
+									}
+									break;
+
+						case STATE_DISCHARGING:
+									CHG_LED = 0;
+									DISCHG_LED = 1;
+
+									// 放电启动稳定期：开始后50秒内不进行过放和正常结束检测
+									if ((TimeStamp_GetTick() - discharge_start_tick) < 50000) {
+											break;
+									}
+
+									// ----- 过放检测及延时确认 -----
+									if (curBatVolt <= overdischargeProtectVolt && curDischargeCurrentMA > 300) {
+											if (!dischg_overd_waiting) {
+													// 首次检测到过放条件，开始延时确认
+													dischg_overd_waiting = 1;
+													dischg_overd_wait_start_tick = TimeStamp_GetTick();
+											} else {
+													// 已在等待确认，检查是否到达延时时间
+													if ((TimeStamp_GetTick() - dischg_overd_wait_start_tick) >= UNDER_VOLT_CONFIRM_MS) {
+															// 延时到达，再次确认条件是否仍满足
+															if (curBatVolt <= overdischargeProtectVolt && curDischargeCurrentMA > 300 && curBatVolt >= 500) {
+																	// 确认过放
+                                                                    alarmOverdischarge |= ALARM_OVERDISCHARGE_BIT;
+                                                                    alarmOverdischarge &= ~(ALARM_DISCHARGING_BIT | ALARM_DISCHARGE_COMPLETE_BIT);
+                                                                    alarmOvercharge &= ~(ALARM_CHARGING_BIT | ALARM_CHARGE_COMPLETE_BIT);
+																	readOverdischargeProtectVolt = curBatVolt;
+																	DISCHARGE_CTRL = 0;
+																	FAN_CTRL = 0;
+																	discharge_capacity_num = 0;
+																	discharge_capacity_int = 0;
+																	discharge_capacity_frac = 0;
+																	current_state = STATE_IDLE;
+																	dischg_overd_waiting = 0;
+																	break;   // 退出switch，终止本次循环
+															} else {
+																	// 假信号，清除等待标志
+																	dischg_overd_waiting = 0;
+															}
+													}
+											}
+									} else {
+											// 当前不满足过放条件，若正在等待则取消等待（假信号提前消失）
+											if (dischg_overd_waiting) {
+													dischg_overd_waiting = 0;
+											}
+									}
+
+									// ----- // ----- 正常放电结束检测（电流 ≤ 150mA，连续3秒确认）-----
+									if (curDischargeCurrentMA <= 300) {
+											if (!dischg_complete_waiting) {
+													// 第一次检测，开始3秒确认
+													dischg_complete_waiting = 1;
+													dischg_complete_wait_start_tick = TimeStamp_GetTick();
+											} else if ((TimeStamp_GetTick() - dischg_complete_wait_start_tick) >= DISCHG_COMPLETE_CONFIRM_MS) {
+													// 3秒确认完成
+													if (dischg_overd_waiting) {
+															dischg_overd_waiting = 0;
+													}
+													DISCHARGE_CTRL = 0;
+													FAN_CTRL = 0;
+													cycleDischargeEndMAH[curCycleNum] = curDischargeMAH;
+                                            alarmOverdischarge &= ~ALARM_DISCHARGING_BIT;
+                                            alarmOverdischarge |= ALARM_DISCHARGE_COMPLETE_BIT;
+													discharge_capacity_num = 0;
+													discharge_capacity_int = 0;
+													discharge_capacity_frac = 0;
+													current_state = STATE_DISCHARGE_COMPLETE;
+													dischg_complete_waiting = 0;
+											}
+									} else {
+											// 条件消失，清除等待
+											dischg_complete_waiting = 0;
+									}
+									break;
+
+
+        case STATE_INIT_CHECK:
+            CHG_LED = 0;
+            DISCHG_LED = 1;
+            FAN_CTRL = 0;  // 自检期间关闭风扇
+            if (init_check_phase == 0) {
+                /* 阶段0：放电检测 - 等待1秒看电压/电流 */
+                if ((TimeStamp_GetTick() - init_check_tick) >= 50000) {
+                    /* 2秒后检查 */
+                    if (curBatVolt < NO_BAT_VOLT_THRESHOLD && curDischargeCurrentMA < NO_BAT_CURR_THRESHOLD) {
+                        /* 电压<5V且无电流 → 疑似无电池，进入充电验证 */
+                        DISCHARGE_CTRL = 0;
+                        alarmOverdischarge &= ~(ALARM_DISCHARGING_BIT | ALARM_DISCHARGE_COMPLETE_BIT);
+                        alarmOvercharge |= ALARM_CHARGING_BIT;
+                        charge_capacity_num = 0;
+                        charge_capacity_int = 0;
+                        charge_capacity_frac = 0;
+                        SetChargeParamsByBatteryType();
+                        CHARGE_CTRL = 1;
+                        CHG_CURRENT_SET = 1;
+                        init_check_phase = 1;
+                        init_check_tick = TimeStamp_GetTick();
+                        CHG_LED = 1;
+                    } else {
+                        /* 电压正常或有电流 → 真电池 → IDLE */
+                        DISCHARGE_CTRL = 0;
+                        alarmOverdischarge &= ~(ALARM_DISCHARGING_BIT | ALARM_DISCHARGE_COMPLETE_BIT);
+                        current_state = STATE_IDLE;
+                    }
+                }
+            } else {
+                /* 阶段1：充电检测 - 检查电流能否达到300mA */
+                delay_ms(5000);
+                if (curChargeCurrentMA >= NO_BAT_CURR_THRESHOLD) {
+                    /* 有充电电流 → 真电池（只是没电）→ IDLE */
+                    
+                    CHARGE_CTRL = 0;
+                    alarmOvercharge &= ~ALARM_CHARGING_BIT;
+                    current_state = STATE_IDLE;
+                } else if ((TimeStamp_GetTick() - init_check_tick) >= NO_BAT_CHECK_TIMEOUT_MS) {
+                    /* 10秒超时，电流始终<300mA → 确认无电池 */
+                    CHARGE_CTRL = 0;
+                    alarmOvercharge &= ~(ALARM_CHARGING_BIT | ALARM_CHARGE_COMPLETE_BIT);
+                    alarmOverdischarge &= ~(ALARM_OVERDISCHARGE_BIT | ALARM_DISCHARGE_COMPLETE_BIT | ALARM_DISCHARGING_BIT);
+                    /* 进入无电池状态: 保持放电，等待电池插入 */
+                    no_battery_flag = 1;
+                    alarmOvercharge |= ALARM_NO_BATTERY_BIT;  // 上报无电池
+                    alarmOverdischarge |= ALARM_DISCHARGING_BIT;
+                    DISCHARGE_CTRL = 1;
+                    current_state = STATE_NO_BATTERY;
+                }
+            }
+            break;
+
+        case STATE_NO_BATTERY:
+            CHG_LED = 0;
+            DISCHG_LED = 1;
+            FAN_CTRL = 0;  // 无电池状态不转风扇
+            DISCHARGE_CTRL = 1;
+            alarmOverdischarge |= ALARM_DISCHARGING_BIT;
+            
+            /* 检测电池插入: 电压回升到5V以上 */
+            if (curBatVolt >= NO_BAT_VOLT_THRESHOLD) {
+                no_battery_flag = 0;
+                alarmOvercharge &= ~ALARM_NO_BATTERY_BIT;  // 清除无电池标志
+                DISCHARGE_CTRL = 0;
+                alarmOverdischarge &= ~(ALARM_DISCHARGING_BIT | ALARM_DISCHARGE_COMPLETE_BIT);
+                alarmOvercharge &= ~(ALARM_OVERCHARGE_BIT | ALARM_CHARGE_COMPLETE_BIT | ALARM_CHARGING_BIT);
+                current_state = STATE_IDLE;
+            }
+            break;
+
+            case STATE_CHARGE_COMPLETE:
+                 // 充电完成，不再自动放电
+                alarmOvercharge &= ~ALARM_CHARGING_BIT;
+                alarmOvercharge |= ALARM_CHARGE_COMPLETE_BIT;
+                // (注：bit0 保留给过充报警，bit1 表示正常充满)
+                CHARGE_CTRL = 0;              // 关闭充电开关
+                cycleChargeEndMAH[curCycleNum] = curChargeMAH;  // 记录本次充电容量
+                charge_capacity_int = 0;
+                charge_capacity_frac = 0;
+                current_state = STATE_IDLE;   // 回到空闲状态
+                break;
+
+            case STATE_DISCHARGE_COMPLETE:
+                 // 放电完成，不再自动充电，循环次数计数器也不增加
+                alarmOverdischarge &= ~ALARM_DISCHARGING_BIT;
+                alarmOverdischarge |= ALARM_DISCHARGE_COMPLETE_BIT;
+                // (注：bit0 保留给过放报警，bit1 表示正常放完)
+                DISCHARGE_CTRL = 0;
+                FAN_CTRL = 0;                 // 关闭风扇
+                cycleDischargeEndMAH[curCycleNum] = curDischargeMAH; // 记录本次放电容量
+                discharge_capacity_int = 0;
+                discharge_capacity_frac = 0;
+                current_state = STATE_IDLE;
+                break;
+
+            default:
+                break;
+        }
+				if ((TimeStamp_GetTick() - last_print_tick) >= 10000)  // 100us * 10000 = 1秒
+				{
+						char print_buf[128];   // 足够容纳所有数据
+
+						// 格式化所有数据（可根据需要调整格式）
+						sprintf(print_buf,
+								"\r\n===== System Data =====\r\n"
+								"BatVolt: %umV\r\n"
+								"ChgCurr: %umA, DisChgCurr: %umA\r\n"
+								"ChgCap: %umAh, DisChgCap: %umAh\r\n"
+								"OvChgProt: %umV, OvDisProt: %umV\r\n"
+								"Cycle: %u/%u\r\n"
+								"AlarmOvChg: %u, AlarmOvDis: %u\r\n"
+								"BatType: %u, ChgVoltSet: %u, ChgCurrSet: %u\r\n"
+								"state = %d\r\n"
+								"=======================\r\n",
+								curBatVolt,
+								curChargeCurrentMA, curDischargeCurrentMA,
+								curChargeMAH, curDischargeMAH,
+								overchargeProtectVolt, overdischargeProtectVolt,
+								curCycleNum, cycleDischargeNum,
+								alarmOvercharge, alarmOverdischarge,
+								batteryType, chargeVoltSet, chargeCurrentSet,
+								current_state
+						);
+
+						PrintString1((u8*)print_buf);   // 通过串口1发送
+						last_print_tick = TimeStamp_GetTick();
+						printf("adc_bat_code = %d\r\n",adc_bat_code);
+				}
+			
+				
+        // 可加入短延时，避免循环过紧
+         NOP10();
+				
+    }
+		
+		
+}
+

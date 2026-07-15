@@ -1,0 +1,1825 @@
+import sys
+import threading
+import time
+import struct
+import serial
+import serial.tools.list_ports
+from PyQt5.QtWidgets import *
+from PyQt5.QtCore import *
+from PyQt5.QtGui import *
+
+# ---------- 协议常量 ----------
+FRAME_HEADER = 0xAA
+
+CMD_START_DISCHARGE    = 0x01
+CMD_STOP_DISCHARGE     = 0x02
+CMD_START_CHARGE       = 0x03
+CMD_STOP_CHARGE        = 0x04
+CMD_SET_OVERC_PROT     = 0x05
+CMD_SET_OVERD_PROT     = 0x06
+CMD_SET_CYCLE_NUM      = 0x07
+CMD_SET_CHARGE_VOLT    = 0x08
+CMD_SET_CHARGE_CUR     = 0x09
+CMD_SET_BAT_TYPE       = 0x0A
+CMD_BUZZER_ON          = 0x0B
+CMD_BUZZER_OFF         = 0x0C
+CMD_BATCH_READ         = 0x10
+
+CMD_ALL_START_CHARGE    = 0x20
+CMD_ALL_STOP_CHARGE     = 0x21
+CMD_ALL_START_DISCHARGE = 0x22
+CMD_ALL_STOP_DISCHARGE  = 0x23
+CMD_ALL_SET_CYCLE_NUM   = 0x24
+CMD_ALL_SET_BAT_TYPE    = 0x25
+CMD_ALL_EMERGENCY_STOP  = 0x26
+CMD_ALL_BUZZER_ON       = 0x27
+CMD_ALL_BUZZER_OFF      = 0x28
+
+MODULE_COUNT = 32
+MODULE_ADDRS = [0x60 + i for i in range(MODULE_COUNT)]
+
+CMD_NAMES = {
+    CMD_START_DISCHARGE: "Start Discharge", CMD_STOP_DISCHARGE: "Stop Discharge",
+    CMD_START_CHARGE: "Start Charge", CMD_STOP_CHARGE: "Stop Charge",
+    CMD_SET_OVERC_PROT: "Set Overcharge Protect", CMD_SET_OVERD_PROT: "Set Overdischarge Protect",
+    CMD_SET_CYCLE_NUM: "Set Cycle Number", CMD_SET_CHARGE_VOLT: "Set Charge Voltage",
+    CMD_SET_CHARGE_CUR: "Set Charge Current", CMD_SET_BAT_TYPE: "Set Battery Type",
+    CMD_BATCH_READ: "Batch Read",
+    CMD_BUZZER_ON: "Buzzer On", CMD_BUZZER_OFF: "Buzzer Off",
+    CMD_ALL_START_CHARGE: "All Start Charge", CMD_ALL_STOP_CHARGE: "All Stop Charge",
+    CMD_ALL_START_DISCHARGE: "All Start Discharge", CMD_ALL_STOP_DISCHARGE: "All Stop Discharge",
+    CMD_ALL_SET_CYCLE_NUM: "All Set Cycle Num", CMD_ALL_SET_BAT_TYPE: "All Set Battery Type",
+    CMD_ALL_EMERGENCY_STOP: "Emergency Stop",
+    CMD_ALL_BUZZER_ON: "All Buzzer On", CMD_ALL_BUZZER_OFF: "All Buzzer Off"
+}
+
+STAGE_IDLE = 0
+STAGE_CHARGE1 = 1
+STAGE_DISCHARGE = 2
+STAGE_CHARGE2 = 3
+STAGE_COMPLETED = 4
+
+CURRENT_THRESHOLD = 50  # mA
+
+
+# ---------- 双语支持 ----------
+class LanguageManager:
+    _instance = None
+    def __init__(self):
+        self.lang = 'zh'  # 'zh' or 'en'
+        self.strings = {
+            # 通用
+            'ok': {'zh': '确定', 'en': 'OK'},
+            'cancel': {'zh': '取消', 'en': 'Cancel'},
+            'yes': {'zh': '是', 'en': 'Yes'},
+            'no': {'zh': '否', 'en': 'No'},
+            'warning': {'zh': '警告', 'en': 'Warning'},
+            'error': {'zh': '错误', 'en': 'Error'},
+            'information': {'zh': '信息', 'en': 'Information'},
+            'confirm': {'zh': '确认', 'en': 'Confirm'},
+            'clear_log': {'zh': '清空日志', 'en': 'Clear Log'},
+            # UI 标题
+            'window_title': {'zh': '电池测试仪监控', 'en': 'Battery Tester Monitor'},
+            'control_panel': {'zh': '控制面板', 'en': 'Control Panel'},
+            'serial_settings': {'zh': '串口设置', 'en': 'Serial Settings'},
+            'port': {'zh': '端口:', 'en': 'Port:'},
+            'baudrate': {'zh': '波特率:', 'en': 'Baudrate:'},
+            'refresh': {'zh': '刷新', 'en': 'Refresh'},
+            'connect': {'zh': '连接', 'en': 'Connect'},
+            'disconnect': {'zh': '断开', 'en': 'Disconnect'},
+            'select_module': {'zh': '选择模块:', 'en': 'Select Module:'},
+            'start_charge': {'zh': '开始充电', 'en': 'Start Charge'},
+            'stop_charge': {'zh': '停止充电', 'en': 'Stop Charge'},
+            'start_discharge': {'zh': '开始放电', 'en': 'Start Discharge'},
+            'stop_discharge': {'zh': '停止放电', 'en': 'Stop Discharge'},
+            'all_modules_control': {'zh': '全部模块控制', 'en': 'All Modules Control'},
+            'all_start_charge': {'zh': '全部开始充电', 'en': 'All Start Charge'},
+            'all_stop_charge': {'zh': '全部停止充电', 'en': 'All Stop Charge'},
+            'all_start_discharge': {'zh': '全部开始放电', 'en': 'All Start Discharge'},
+            'all_stop_discharge': {'zh': '全部停止放电', 'en': 'All Stop Discharge'},
+            'emergency_stop': {'zh': '紧急停止 (全部停止)', 'en': 'EMERGENCY STOP (All Stop)'},
+            'stop_buzzer': {'zh': '停止蜂鸣器', 'en': 'Stop Buzzer'},
+            'set_cycle_num': {'zh': '设置循环次数:', 'en': 'Set Cycle Number:'},
+            'set_for_selected': {'zh': '为选中模块设置', 'en': 'Set for Selected'},
+            'set_for_all': {'zh': '为所有模块设置', 'en': 'Set for ALL'},
+            'battery_type': {'zh': '电池类型 (所有在线模块):', 'en': 'Battery Type (All Online):'},
+            'set_for_all_online': {'zh': '为所有在线模块设置', 'en': 'Set for All Online'},
+            'export_excel': {'zh': '导出历史记录到Excel', 'en': 'Export History to Excel'},
+            'single_module_test': {'zh': '单模块测试', 'en': 'Single Module Test'},
+            'lower_limit': {'zh': '下限 (mAh):', 'en': 'Lower Limit (mAh):'},
+            'upper_limit': {'zh': '上限 (mAh):', 'en': 'Upper Limit (mAh):'},
+            'start_test_on_selected': {'zh': '开始测试选中模块', 'en': 'Start Test on Selected'},
+            'stop_test': {'zh': '停止测试', 'en': 'Stop Test'},
+            'test_status': {'zh': '测试状态: 空闲', 'en': 'Test Status: Idle'},
+            'global_test': {'zh': '全局测试 (所有在线模块)', 'en': 'Global Test (All Online)'},
+            'start_loop_test': {'zh': '开始循环测试', 'en': 'Start Loop Test'},
+            'stop_loop_test': {'zh': '停止循环测试', 'en': 'Stop Loop Test'},
+            'start_global_test': {'zh': '开始全局测试', 'en': 'Start Global Test'},
+            'global_test_status_idle': {'zh': '全局测试: 空闲', 'en': 'Global Test: Idle'},
+            'current_data': {'zh': '当前数据:', 'en': 'Current Data:'},
+            'cycle_history': {'zh': '循环历史记录 (每循环充电/放电容量mAh):', 'en': 'Cycle History (Charge/Discharge mAh per cycle):'},
+            'show_comm_log': {'zh': '显示通信日志', 'en': 'Show Communication Log'},
+            # 表格列标题
+            'col_addr': {'zh': '地址', 'en': 'Addr'},
+            'col_voltage': {'zh': '电压(mV)', 'en': 'Voltage(mV)'},
+            'col_chg_cur': {'zh': '充电电流(mA)', 'en': 'Chg Cur(mA)'},
+            'col_dchg_cur': {'zh': '放电电流(mA)', 'en': 'Dchg Cur(mA)'},
+            'col_chg_mah': {'zh': '充电mAh', 'en': 'Chg mAh'},
+            'col_dchg_mah': {'zh': '放电mAh', 'en': 'Dchg mAh'},
+            'col_status': {'zh': '状态', 'en': 'Status'},
+            'col_cycle': {'zh': '循环', 'en': 'Cycle'},
+            'col_test_status': {'zh': '测试状态', 'en': 'Test Status'},
+            'col_qc_result': {'zh': 'QC结果', 'en': 'QC Result'},
+            'col_test_caps': {'zh': '测试容量', 'en': 'Test Caps'},
+            'col_alarm_type': {'zh': '报警类型', 'en': 'Alarm Type'},
+            # 对话框消息
+            'no_ports_found': {'zh': '未找到端口', 'en': 'No ports found'},
+            'not_connected': {'zh': '未连接', 'en': 'Not connected'},
+            'no_online_modules': {'zh': '未检测到在线模块', 'en': 'No online modules detected'},
+            'confirm_emergency_stop': {'zh': '发送停止命令给所有模块?', 'en': 'Send STOP to ALL modules?'},
+            'confirm_set_bat_type': {'zh': '为所有在线模块设置电池类型为 0x{:02X}?', 'en': 'Set battery type to 0x{:02X} for all online modules?'},
+            'missing_library': {'zh': '缺少库', 'en': 'Missing Library'},
+            'install_openpyxl': {'zh': '请安装 openpyxl', 'en': 'Please install openpyxl'},
+            'export_complete': {'zh': '导出完成', 'en': 'Export Complete'},
+            'export_path': {'zh': '历史记录已导出至:\n{}', 'en': 'History exported to:\n{}'},
+            'test_running': {'zh': '测试已在运行中', 'en': 'A test is already running'},
+            'confirm_start_global_test': {'zh': '在 {} 个模块上开始独立测试?\n限制: {} - {} mAh', 'en': 'Start independent test on {} module(s)?\nLimits: {} - {} mAh'},
+            'confirm_start_test': {'zh': '在模块 0x{:02X} 上开始测试?', 'en': 'Start test on module 0x{:02X}?'},
+            'confirm_stop_test': {'zh': '停止当前测试以及所有充放电?', 'en': 'Stop current test and all charging/discharging?'},
+            'test_timeout': {'zh': '测试阶段超时！强制停止。', 'en': 'Test stage timeout! Forcing stop.'},
+            'test_stopped_user': {'zh': '测试已停止', 'en': 'Test stopped by user'},
+            'confirm_stop_loop': {'zh': '停止当前循环测试?', 'en': 'Stop current loop test?'},
+            'loop_completed': {'zh': '所有循环测试完成。', 'en': 'All loop cycles completed.'},
+            'loop_completed_msg': {'zh': '循环测试已完成 {} 次循环。\n容量已保存在循环历史中。', 'en': 'Loop test completed after {} cycles.\nCapacities saved in cycle history.'},
+            'loop_stopped_user': {'zh': '用户已停止循环测试。', 'en': 'Loop test stopped by user.'},
+            'module_no_data': {'zh': '模块 0x{:02X} 无数据', 'en': 'Module 0x{:02X} has no data'},
+            'cycle_num_warning': {'zh': '循环次数至少为1', 'en': 'Cycle number must be at least 1'},
+            'confirm_start_loop': {'zh': '在 {} 个模块上开始循环测试?\n总循环次数: {} (每个循环 = 充电 → 放电)', 'en': 'Start loop test on {} module(s)?\nTotal cycles: {} (each cycle = charge → discharge)'},
+            'global_test_complete_msg': {'zh': '所有模块测试完成。QC结果显示在“QC结果”列中。', 'en': 'All modules tested. Results shown in QC Result column.'},
+            # 状态栏和日志消息
+            'connected': {'zh': '已连接到 {} 波特率 {}', 'en': 'Connected to {} at {} baud'},
+            'serial_error': {'zh': '串口错误: {}', 'en': 'Serial error: {}'},
+            'serial_port_closed': {'zh': '串口已关闭', 'en': 'Serial port closed'},
+            'cannot_send': {'zh': '无法发送命令: 串口未打开', 'en': 'Cannot send command: serial port not open'},
+            'write_error': {'zh': '写入错误: {}', 'en': 'Write error: {}'},
+            'discard_garbage': {'zh': '丢弃无效数据 (无 AA): {}...', 'en': 'Discarding garbage (no AA): {}...'},
+            'skip_garbage': {'zh': '跳过 AA 前的垃圾数据: {}...', 'en': 'Skipping garbage before AA: {}...'},
+            'checksum_error': {'zh': '校验和错误', 'en': 'Checksum error'},
+            'batch_data_len_error': {'zh': '批量数据长度错误', 'en': 'Batch data length mismatch'},
+            'command_succeeded': {'zh': "命令 '{}' 成功。", 'en': "Command '{}' succeeded."},
+            'command_failed': {'zh': "命令 '{}' 失败。", 'en': "Command '{}' FAILED."},
+            'emergency_stop_sent': {'zh': '紧急停止已发送', 'en': 'Emergency stop sent'},
+            'buzzers_off': {'zh': '所有蜂鸣器已关闭', 'en': 'All buzzers turned off'},
+            'set_cycle_num_module': {'zh': '为 0x{:02X} 设置循环次数为 {}', 'en': 'Set cycle number for 0x{:02X} to {}'},
+            'set_cycle_num_all': {'zh': '为所有模块设置循环次数为 {}', 'en': 'Set cycle number for ALL modules to {}'},
+            'set_bat_type_all': {'zh': '为所有模块设置电池类型', 'en': 'Set battery type for all modules'},
+            'default_settings_sent': {'zh': '默认设置已发送给所有在线模块', 'en': 'Default settings sent to all online modules'},
+            'alarm_overcharge': {'zh': '模块 0x{:02X} 过充报警！', 'en': 'Module 0x{:02X} OVERCHARGE ALARM!'},
+            'alarm_overdischarge': {'zh': '模块 0x{:02X} 过放报警！', 'en': 'Module 0x{:02X} OVERDISCHARGE ALARM!'},
+            'charge_started': {'zh': '模块 0x{:02X} 开始充电', 'en': 'Module 0x{:02X} charging started'},
+            'charge_stopped': {'zh': '模块 0x{:02X} 停止充电', 'en': 'Module 0x{:02X} charging stopped'},
+            'discharge_started': {'zh': '模块 0x{:02X} 开始放电', 'en': 'Module 0x{:02X} discharging started'},
+            'discharge_stopped': {'zh': '模块 0x{:02X} 停止放电', 'en': 'Module 0x{:02X} discharging stopped'},
+            'charge1_completed': {'zh': '模块 0x{:02X} 第一次充电完成', 'en': 'Module 0x{:02X} Charge1 completed'},
+            'discharge_completed': {'zh': '模块 0x{:02X} 放电完成', 'en': 'Module 0x{:02X} Discharge completed'},
+            'discharge_done': {'zh': '模块 0x{:02X} 放电完成: {}mAh, 开始第二次充电', 'en': 'Module 0x{:02X} discharge done: {}mAh, start charge2'},
+            'charge2_completed': {'zh': '模块 0x{:02X} 第二次充电完成', 'en': 'Module 0x{:02X} Charge2 completed'},
+            'charge2_empty_retry': {'zh': '模块 0x{:02X} 第二次充电容量为0, 重试', 'en': 'Module 0x{:02X} Charge2 empty, retry'},
+            'test_finished_result': {'zh': '模块 0x{:02X} 测试结束, 结果={}', 'en': 'Module 0x{:02X} test finished, result={}'},
+            'abort_test_reason': {'zh': '模块 0x{:02X} 测试中止: {}', 'en': 'Module 0x{:02X} test aborted: {}'},
+            'global_test_started': {'zh': '全局独立测试已开始, 模块数: {}', 'en': 'Global independent test started on {} modules'},
+            'single_test_started': {'zh': '单模块测试已开始于 0x{:02X}', 'en': 'Single module test started on 0x{:02X}'},
+            'loop_test_started': {'zh': '循环测试已开始, 每个模块目标循环数: {}', 'en': 'Loop test started, target cycles: {} for each module'},
+            'module_completed_cycles': {'zh': '模块 0x{:02X} 已完成 {} 次循环', 'en': 'Module 0x{:02X} completed {} cycles'},
+            'all_modules_completed': {'zh': '所有模块已完成当前循环', 'en': 'All modules completed current cycle'},
+            'all_modules_completed_loop': {'zh': '所有模块已完成循环测试', 'en': 'All modules completed loop test'},
+            'stop_all_modules': {'zh': '已停止所有模块并关闭蜂鸣器', 'en': 'All modules stopped and buzzers off'},
+            'test_running_global': {'zh': '全局测试运行中...', 'en': 'Global test running...'},
+            'global_test_independent': {'zh': '全局测试: 独立运行', 'en': 'Global Test: Running independently'},
+            'single_test_first_charge': {'zh': '测试状态: 首次充电中 0x{:02X}', 'en': 'Test Status: First Charging on 0x{:02X}'},
+            'loop_test_running': {'zh': '循环测试运行中...', 'en': 'Loop test running...'},
+            'loop_test_status': {'zh': '循环测试: {}/{} 循环 (进行中)', 'en': 'Loop Test: {}/{} cycles (ongoing)'},
+        }
+
+    @classmethod
+    def instance(cls):
+        if cls._instance is None:
+            cls._instance = LanguageManager()
+        return cls._instance
+
+    def tr(self, key, **kwargs):
+        text = self.strings.get(key, {}).get(self.lang, key)
+        if kwargs:
+            try:
+                text = text.format(**kwargs)
+            except:
+                pass
+        return text
+
+    def set_language(self, lang):
+        self.lang = lang
+
+
+def tr(key, **kwargs):
+    return LanguageManager.instance().tr(key, **kwargs)
+
+
+# ---------- 模块状态机 ----------
+class ModuleTestState:
+    def __init__(self, idx, lower_limit, upper_limit):
+        self.idx = idx
+        self.lower_limit = lower_limit
+        self.upper_limit = upper_limit
+        self.stage = STAGE_IDLE
+        self.charge1_start = 0
+        self.charge1_max = 0
+        self.discharge_start = 0
+        self.discharge_max = 0
+        self.charge2_start = 0
+        self.charge2_max = 0
+        self.discharge_cap = 0
+        self.charge2_cap = 0
+        self.result = None
+        self.completed = False
+        self.no_battery = False
+
+    def start(self, initial_charge_mah, initial_discharge_mah):
+        self.stage = STAGE_CHARGE1
+        self.charge1_start = initial_charge_mah
+        self.charge1_max = initial_charge_mah
+        self.discharge_start = initial_discharge_mah
+        self.discharge_max = initial_discharge_mah
+        self.charge2_start = initial_charge_mah
+        self.charge2_max = initial_charge_mah
+        self.discharge_cap = 0
+        self.charge2_cap = 0
+        self.result = None
+        self.completed = False
+        self.no_battery = False
+
+
+class LoopModuleState:
+    def __init__(self, idx, total_cycles):
+        self.idx = idx
+        self.total_cycles = total_cycles
+        self.current_cycle = 0
+        self.stage = STAGE_IDLE
+        self.completed = False
+        self.discharge_start = 0
+        self.charge_start = 0
+
+    def start(self, init_charge_mah, init_discharge_mah):
+        self.stage = STAGE_CHARGE1
+        self.charge_start = init_charge_mah
+        self.discharge_start = init_discharge_mah
+        self.current_cycle = 0
+        self.completed = False
+        self.charge_end = 0
+        self.skip_first = True  # skip pre-charge recording
+
+
+# ---------- 串口线程 ----------
+class SerialThread(QThread):
+    data_received = pyqtSignal(list)
+    command_response = pyqtSignal(int, int, bytes)
+    error_occurred = pyqtSignal(str)
+    log_message = pyqtSignal(str)
+
+    def __init__(self, port, baudrate=115200):
+        super().__init__()
+        self.port = port
+        self.baudrate = baudrate
+        self.ser = None
+        self.running = False
+        self.lock = threading.Lock()
+        self.request_data = True
+        self.batch_interval = 0.5
+        self.last_batch_time = 0
+
+    def run(self):
+        try:
+            self.ser = serial.Serial(self.port, self.baudrate, timeout=0.2)
+            self.ser.set_buffer_size(rx_size=8192, tx_size=4096)
+            self.log_message.emit(tr('connected', self.port, self.baudrate))
+            self.running = True
+            self.ser.reset_input_buffer()
+            self.ser.reset_output_buffer()
+
+            while self.running:
+                if self.ser.in_waiting:
+                    self.read_frame()
+                else:
+                    time.sleep(0.01)
+        except serial.SerialException as e:
+            self.error_occurred.emit(tr('serial_error', str(e)))
+            self.log_message.emit(tr('serial_error', str(e)))
+        except Exception as e:
+            self.error_occurred.emit(str(e))
+            self.log_message.emit(f"Serial thread error: {e}")
+        finally:
+            if self.ser and self.ser.is_open:
+                self.ser.close()
+                self.log_message.emit(tr('serial_port_closed'))
+
+    def send_command(self, cmd, addr, data=None):
+        if self.ser is None or not self.ser.is_open:
+            self.log_message.emit(tr('cannot_send'))
+            return
+        if data is None:
+            data = []
+        length = len(data)
+        frame = bytearray([FRAME_HEADER, cmd, addr])
+        frame.append((length >> 8) & 0xFF)
+        frame.append(length & 0xFF)
+        frame.extend(data)
+        checksum = cmd ^ addr ^ (length >> 8) ^ (length & 0xFF)
+        for b in data:
+            checksum ^= b
+        frame.append(checksum)
+
+        with self.lock:
+            try:
+                self.ser.write(frame)
+            except serial.SerialException as e:
+                self.log_message.emit(tr('write_error', str(e)))
+                self.error_occurred.emit(str(e))
+                return
+
+        frame_hex = ' '.join(f'{b:02X}' for b in frame)
+        cmd_name = CMD_NAMES.get(cmd, f"Unknown(0x{cmd:02X})")
+        addr_str = f"0x{addr:02X}" if addr != 0 else "Broadcast"
+        self.log_message.emit(f"[TX] {frame_hex} | Cmd: {cmd_name} | Addr: {addr_str} | Data: {data}")
+
+    def send_all_command(self, cmd, data=None):
+        self.send_command(cmd, 0x00, data)
+
+    def send_batch_read(self):
+        self.send_command(CMD_BATCH_READ, 0x00)
+
+    def read_frame(self):
+        buffer = bytearray()
+        max_attempts = 3
+        while self.running and max_attempts > 0:
+            if self.ser.in_waiting:
+                chunk = self.ser.read(self.ser.in_waiting)
+                if chunk:
+                    buffer.extend(chunk)
+            if len(buffer) < 5:
+                time.sleep(0.005)
+                continue
+            idx = buffer.find(b'\xAA')
+            if idx == -1:
+                if buffer:
+                    discard = buffer[:min(20, len(buffer))]
+                    hex_discard = ' '.join(f'{b:02X}' for b in discard)
+                    self.log_message.emit(tr('discard_garbage', hex_discard))
+                buffer.clear()
+                time.sleep(0.005)
+                continue
+            if idx > 0:
+                discard = buffer[:idx]
+                hex_discard = ' '.join(f'{b:02X}' for b in discard[:20])
+                self.log_message.emit(tr('skip_garbage', hex_discard))
+                buffer = buffer[idx:]
+            if len(buffer) < 5:
+                continue
+            cmd = buffer[1]
+            status = buffer[2]
+            len_h = buffer[3]
+            len_l = buffer[4]
+            data_len = (len_h << 8) | len_l
+            total_frame_len = 1 + 4 + data_len + 1
+            if len(buffer) < total_frame_len:
+                time.sleep(0.005)
+                continue
+            frame = buffer[:total_frame_len]
+            buffer = buffer[total_frame_len:]
+            calc_checksum = cmd ^ status ^ len_h ^ len_l
+            data_part = frame[5:5+data_len]
+            for b in data_part:
+                calc_checksum ^= b
+            if calc_checksum != frame[-1]:
+                self.log_message.emit(tr('checksum_error'))
+                buffer = buffer[1:] if buffer else bytearray()
+                continue
+            self.process_frame(frame, cmd, status, data_len, data_part)
+            max_attempts -= 1
+
+    def process_frame(self, frame, cmd, status, data_len, data):
+        frame_hex = 'AA ' + ' '.join(f'{b:02X}' for b in frame[1:])
+        cmd_name = CMD_NAMES.get(cmd, f"Unknown(0x{cmd:02X})")
+        status_str = 'OK' if status == 0 else 'Error'
+        self.log_message.emit(f"[RX] {frame_hex} | Cmd: {cmd_name} | Status: {status_str}")
+
+        if cmd == CMD_BATCH_READ and status == 0:
+            expected_len = MODULE_COUNT * 12
+            if data_len != expected_len:
+                self.log_message.emit(tr('batch_data_len_error'))
+                return
+            modules = []
+            offset = 0
+            for i in range(MODULE_COUNT):
+                if offset + 12 > len(data):
+                    break
+                volt = struct.unpack('>H', data[offset:offset+2])[0]
+                chg_cur = struct.unpack('>H', data[offset+2:offset+4])[0]
+                dchg_cur = struct.unpack('>H', data[offset+4:offset+6])[0]
+                chg_mah = struct.unpack('>H', data[offset+6:offset+8])[0]
+                dchg_mah = struct.unpack('>H', data[offset+8:offset+10])[0]
+                status_byte = data[offset+10]
+                cycle = data[offset+11]
+                modules.append({
+                    'addr': MODULE_ADDRS[i],
+                    'voltage': volt,
+                    'charge_current': chg_cur,
+                    'charge_mah': chg_mah,
+                    'discharge_current': dchg_cur,
+                    'discharge_mah': dchg_mah,
+                    'status': status_byte,
+                    'cycle': cycle
+                })
+                offset += 12
+            self.data_received.emit(modules)
+        else:
+            self.command_response.emit(cmd, status, bytes(data))
+
+    def stop(self):
+        self.running = False
+        self.wait()
+
+
+# ---------- 日志窗口 ----------
+class LogWindow(QDialog):
+    closed = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(tr('show_comm_log'))
+        self.resize(600, 400)
+        layout = QVBoxLayout(self)
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        layout.addWidget(self.log_text)
+        self.btn_clear = QPushButton(tr('clear_log'))
+        self.btn_clear.clicked.connect(self.log_text.clear)
+        layout.addWidget(self.btn_clear)
+        self.max_lines = 500
+
+    def append_log(self, msg):
+        timestamp = QTime.currentTime().toString("hh:mm:ss.zzz")
+        self.log_text.append(f"[{timestamp}] {msg}")
+        doc = self.log_text.document()
+        while doc.blockCount() > self.max_lines:
+            cursor = QTextCursor(doc.findBlockByLineNumber(0))
+            cursor.select(QTextCursor.BlockUnderCursor)
+            cursor.removeSelectedText()
+            cursor.deleteChar()
+        self.log_text.ensureCursorVisible()
+
+    def closeEvent(self, event):
+        self.closed.emit()
+        super().closeEvent(event)
+
+
+# ---------- 主窗口 ----------
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(tr('window_title'))
+        self.setMinimumSize(1250, 850)
+
+        # 数据变量
+        self.modules_data = [None] * MODULE_COUNT
+        self.set_cycle_nums = [0] * MODULE_COUNT
+        self.cycle_records = [[] for _ in range(MODULE_COUNT)]
+        self.last_cycle = [0] * MODULE_COUNT
+        self.last_status = [0] * MODULE_COUNT
+        self.last_charge_mah = [0] * MODULE_COUNT
+        self.last_discharge_mah = [0] * MODULE_COUNT
+
+        self.charge_max = [0] * MODULE_COUNT
+        self.discharge_max = [0] * MODULE_COUNT
+        self.charge_start_mah = [0] * MODULE_COUNT
+        self.discharge_start_mah = [0] * MODULE_COUNT
+
+        self.online_modules = set()
+        self.batch_read_received = False
+
+        self.serial_thread = None
+        self.log_window = None
+
+        self.test_running = False
+        self.global_test_mode = False
+        self.module_test_states = {}
+        self.global_test_results = [None] * MODULE_COUNT
+        self.single_test_state = None
+
+        self.loop_test_active = False
+        self.loop_current_cycle = 0
+        self.loop_total_cycles = 0
+
+        self.test_stage_timer = QTimer()
+        self.test_stage_timer.setSingleShot(True)
+        self.test_stage_timer.timeout.connect(self.on_test_timeout)
+
+        self.buzzer_timer = QTimer()
+        self.buzzer_timer.timeout.connect(self.check_ng_and_buzz)
+        self.buzzer_timer_interval = 5000
+        self.ng_buzzer_set = set()
+        self.last_alarm_time = 0
+
+        self.current_check_timer = QTimer()
+        self.current_check_timer.timeout.connect(self.check_remaining_current)
+        self.current_check_timer.setInterval(1000)
+
+        self.no_battery_stop_timer = QTimer()
+        self.no_battery_stop_timer.timeout.connect(self.force_stop_no_battery_modules)
+        self.no_battery_stop_timer.setInterval(2000)
+
+        self.batch_read_timer = QTimer()
+        self.batch_read_timer.timeout.connect(self.trigger_batch_read)
+
+        self.setup_ui()
+        self.refresh_serial_ports()
+        self.apply_stylesheet()
+
+        self.statusBar = QStatusBar()
+        self.setStatusBar(self.statusBar)
+
+        screen = QApplication.primaryScreen()
+        if screen:
+            size = screen.availableSize()
+            self.resize(int(size.width() * 0.8), int(size.height() * 0.85))
+
+        # 语言切换按钮
+        self.lang_btn = QPushButton("English")
+        self.lang_btn.clicked.connect(self.toggle_language)
+        self.statusBar.addPermanentWidget(self.lang_btn)
+
+    def toggle_left_panel(self):
+        if self.left_panel_visible:
+            self.left_panel.hide()
+            self.btn_collapse.setText("▶")
+            self.btn_collapse.setToolTip(self.tr('expand_panel'))
+            self.left_panel_visible = False
+        else:
+            self.left_panel.show()
+            self.btn_collapse.setText("◀")
+            self.btn_collapse.setToolTip(self.tr('collapse_panel'))
+            self.left_panel_visible = True
+    
+    def toggle_language(self):
+        lang_mgr = LanguageManager.instance()
+        if lang_mgr.lang == 'zh':
+            lang_mgr.set_language('en')
+            self.lang_btn.setText("中文")
+        else:
+            lang_mgr.set_language('zh')
+            self.lang_btn.setText("English")
+        self.retranslate_ui()
+
+    def retranslate_ui(self):
+        self.setWindowTitle(tr('window_title'))
+        self.group_control.setTitle(tr('control_panel'))
+        self.group_serial.setTitle(tr('serial_settings'))
+        self.label_port.setText(tr('port'))
+        self.label_baud.setText(tr('baudrate'))
+        self.btn_refresh.setText(tr('refresh'))
+        if self.serial_thread:
+            self.btn_connect.setText(tr('disconnect'))
+        else:
+            self.btn_connect.setText(tr('connect'))
+        self.label_select_module.setText(tr('select_module'))
+        self.btn_start_charge.setText(tr('start_charge'))
+        self.btn_stop_charge.setText(tr('stop_charge'))
+        self.btn_start_discharge.setText(tr('start_discharge'))
+        self.btn_stop_discharge.setText(tr('stop_discharge'))
+        self.group_all_control.setTitle(tr('all_modules_control'))
+        self.btn_all_start_charge.setText(tr('all_start_charge'))
+        self.btn_all_stop_charge.setText(tr('all_stop_charge'))
+        self.btn_all_start_discharge.setText(tr('all_start_discharge'))
+        self.btn_all_stop_discharge.setText(tr('all_stop_discharge'))
+        self.btn_emergency_stop.setText(tr('emergency_stop'))
+        self.btn_stop_buzzer.setText(tr('stop_buzzer'))
+        self.label_cycle.setText(tr('set_cycle_num'))
+        self.btn_set_cycle.setText(tr('set_for_selected'))
+        self.btn_set_cycle_all.setText(tr('set_for_all'))
+        self.label_bat_type.setText(tr('battery_type'))
+        self.btn_set_bat_type_all.setText(tr('set_for_all_online'))
+        self.btn_export_excel.setText(tr('export_excel'))
+        self.group_test.setTitle(tr('single_module_test'))
+        self.label_lower.setText(tr('lower_limit'))
+        self.label_upper.setText(tr('upper_limit'))
+        self.btn_start_test.setText(tr('start_test_on_selected'))
+        self.btn_stop_test.setText(tr('stop_test'))
+        if not self.test_running:
+            self.test_status_label.setText(tr('test_status'))
+        else:
+            if self.loop_test_active:
+                self.test_status_label.setText(tr('loop_test_running'))
+            elif self.global_test_mode:
+                self.test_status_label.setText(tr('test_running_global'))
+        self.group_global_test.setTitle(tr('global_test'))
+        self.btn_loop_test.setText(tr('start_loop_test'))
+        self.btn_stop_loop.setText(tr('stop_loop_test'))
+        self.btn_global_test.setText(tr('start_global_test'))
+        if not self.loop_test_active and not self.global_test_mode:
+            self.global_test_status_label.setText(tr('global_test_status_idle'))
+        elif self.loop_test_active:
+            self.global_test_status_label.setText(tr('loop_test_status', self.loop_current_cycle, self.loop_total_cycles))
+        else:
+            self.global_test_status_label.setText(tr('global_test_independent'))
+        self.label_current_data.setText(tr('current_data'))
+        self.label_history.setText(tr('cycle_history'))
+        self.btn_show_log.setText(tr('show_comm_log'))
+
+        # 表格列标题
+        headers = [tr('col_addr'), tr('col_voltage'), tr('col_chg_cur'), tr('col_dchg_cur'),
+                   tr('col_chg_mah'), tr('col_dchg_mah'), tr('col_status'), tr('col_cycle'),
+                   tr('col_test_status'), tr('col_qc_result'), tr('col_test_caps'), tr('col_alarm_type')]
+        self.table.setHorizontalHeaderLabels(headers)
+        current_port = self.port_combo.currentText()          # 保存当前选中的端口名
+        self.refresh_serial_ports()                           # 重新扫描并填充端口列表
+        index = self.port_combo.findText(current_port)
+        if index >= 0:
+            self.port_combo.setCurrentIndex(index)
+        self.update_table()
+        self.update_history_table()
+
+    def apply_stylesheet(self):
+        self.setStyleSheet("""
+            QGroupBox { font-weight: bold; font-size: 11pt; border: 1px solid #aaaaaa; border-radius: 5px; margin-top: 10px; }
+            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }
+            QPushButton { background-color: #2d7a3d; color: white; border: none; padding: 6px 10px; border-radius: 4px; font-weight: bold; font-size: 11pt; min-height: 30px; }
+            QPushButton:hover { background-color: #23632e; }
+            QPushButton:pressed { background-color: #1a4f23; }
+            QPushButton#emergency { background-color: #d32f2f; }
+            QPushButton#emergency:hover { background-color: #b71c1c; }
+            QTableWidget { gridline-color: #c0c0c0; alternate-background-color: #f5f5f5; font-size: 10pt; }
+            QHeaderView::section { background-color: #e0e0e0; padding: 6px; border: 1px solid #b0b0b0; font-weight: bold; font-size: 12pt; }
+            QComboBox, QSpinBox { padding: 5px; border: 1px solid #b0b0b0; border-radius: 3px; font-size: 11pt; min-height: 28px; }
+            QLabel { font-size: 11pt; }
+            QStatusBar { font-size: 10pt; }
+        """)
+
+    def setup_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QHBoxLayout(central)
+        main_layout.setContentsMargins(5, 5, 5, 5)
+        main_layout.setSpacing(5)
+
+        # 左侧控制面板
+        self.group_control = QGroupBox(tr('control_panel'))
+        control_layout = QVBoxLayout(self.group_control)
+        control_layout.setSpacing(8)
+
+        # 串口设置
+        self.group_serial = QGroupBox(tr('serial_settings'))
+        serial_layout = QGridLayout(self.group_serial)
+        self.label_port = QLabel(tr('port'))
+        serial_layout.addWidget(self.label_port, 0, 0)
+        self.port_combo = QComboBox()
+        serial_layout.addWidget(self.port_combo, 0, 1)
+        self.btn_refresh = QPushButton(tr('refresh'))
+        self.btn_refresh.clicked.connect(self.refresh_serial_ports)
+        serial_layout.addWidget(self.btn_refresh, 0, 2)
+        self.label_baud = QLabel(tr('baudrate'))
+        serial_layout.addWidget(self.label_baud, 1, 0)
+        self.baud_combo = QComboBox()
+        self.baud_combo.addItems(["9600", "19200", "38400", "57600", "115200"])
+        self.baud_combo.setCurrentText("115200")
+        serial_layout.addWidget(self.baud_combo, 1, 1)
+        self.btn_connect = QPushButton(tr('connect'))
+        self.btn_connect.clicked.connect(self.on_connect)
+        serial_layout.addWidget(self.btn_connect, 2, 0, 1, 3)
+        control_layout.addWidget(self.group_serial)
+
+        # 单模块选择
+        self.label_select_module = QLabel(tr('select_module'))
+        control_layout.addWidget(self.label_select_module)
+        self.module_combo = QComboBox()
+        
+        # Collapse/expand left panel button
+        self.btn_collapse = QPushButton("◀")
+        self.btn_collapse.setToolTip(self.tr('collapse_panel'))
+        self.btn_collapse.setFixedWidth(28)
+        self.btn_collapse.clicked.connect(self.toggle_left_panel)
+        self.left_panel_visible = True
+        control_layout.addWidget(self.btn_collapse)
+        self.module_combo.addItems([f"Module 0x{addr:02X}" for addr in MODULE_ADDRS])
+        control_layout.addWidget(self.module_combo)
+
+        # 单模块控制按钮
+        btn_layout = QGridLayout()
+        self.btn_start_charge = QPushButton(tr('start_charge'))
+        self.btn_start_charge.clicked.connect(lambda: self.on_single_command(CMD_START_CHARGE))
+        self.btn_stop_charge = QPushButton(tr('stop_charge'))
+        self.btn_stop_charge.clicked.connect(lambda: self.on_single_command(CMD_STOP_CHARGE))
+        self.btn_start_discharge = QPushButton(tr('start_discharge'))
+        self.btn_start_discharge.clicked.connect(lambda: self.on_single_command(CMD_START_DISCHARGE))
+        self.btn_stop_discharge = QPushButton(tr('stop_discharge'))
+        self.btn_stop_discharge.clicked.connect(lambda: self.on_single_command(CMD_STOP_DISCHARGE))
+        btn_layout.addWidget(self.btn_start_charge, 0, 0)
+        btn_layout.addWidget(self.btn_stop_charge, 0, 1)
+        btn_layout.addWidget(self.btn_start_discharge, 1, 0)
+        btn_layout.addWidget(self.btn_stop_discharge, 1, 1)
+        control_layout.addLayout(btn_layout)
+
+        # 全部模块控制
+        self.group_all_control = QGroupBox(tr('all_modules_control'))
+        all_btn_layout = QGridLayout(self.group_all_control)
+        self.btn_all_start_charge = QPushButton(tr('all_start_charge'))
+        self.btn_all_start_charge.clicked.connect(lambda: self.on_all_command(CMD_START_CHARGE))
+        self.btn_all_stop_charge = QPushButton(tr('all_stop_charge'))
+        self.btn_all_stop_charge.clicked.connect(lambda: self.on_all_command(CMD_STOP_CHARGE))
+        self.btn_all_start_discharge = QPushButton(tr('all_start_discharge'))
+        self.btn_all_start_discharge.clicked.connect(lambda: self.on_all_command(CMD_START_DISCHARGE))
+        self.btn_all_stop_discharge = QPushButton(tr('all_stop_discharge'))
+        self.btn_all_stop_discharge.clicked.connect(lambda: self.on_all_command(CMD_STOP_DISCHARGE))
+        all_btn_layout.addWidget(self.btn_all_start_charge, 0, 0)
+        all_btn_layout.addWidget(self.btn_all_stop_charge, 0, 1)
+        all_btn_layout.addWidget(self.btn_all_start_discharge, 1, 0)
+        all_btn_layout.addWidget(self.btn_all_stop_discharge, 1, 1)
+        control_layout.addWidget(self.group_all_control)
+
+        # 紧急停止
+        self.btn_emergency_stop = QPushButton(tr('emergency_stop'))
+        self.btn_emergency_stop.setObjectName("emergency")
+        self.btn_emergency_stop.clicked.connect(self.on_emergency_stop)
+        control_layout.addWidget(self.btn_emergency_stop)
+
+        # 停止蜂鸣器
+        self.btn_stop_buzzer = QPushButton(tr('stop_buzzer'))
+        self.btn_stop_buzzer.clicked.connect(self.on_stop_buzzer)
+        control_layout.addWidget(self.btn_stop_buzzer)
+
+        # 设置循环数
+        self.label_cycle = QLabel(tr('set_cycle_num'))
+        control_layout.addWidget(self.label_cycle)
+        cycle_layout = QHBoxLayout()
+        self.cycle_spin = QSpinBox()
+        self.cycle_spin.setRange(1, 255)
+        self.cycle_spin.setValue(10)
+        self.btn_set_cycle = QPushButton(tr('set_for_selected'))
+        self.btn_set_cycle.clicked.connect(self.on_set_cycle_num)
+        self.btn_set_cycle_all = QPushButton(tr('set_for_all'))
+        self.btn_set_cycle_all.clicked.connect(self.on_set_cycle_num_all)
+        cycle_layout.addWidget(self.cycle_spin)
+        cycle_layout.addWidget(self.btn_set_cycle)
+        cycle_layout.addWidget(self.btn_set_cycle_all)
+        control_layout.addLayout(cycle_layout)
+
+        # 电池类型
+        self.label_bat_type = QLabel(tr('battery_type'))
+        control_layout.addWidget(self.label_bat_type)
+        bat_layout = QHBoxLayout()
+        self.battery_type_combo = QComboBox()
+        self.battery_type_combo.addItem("五节三元 (00)", 0x00)
+        self.battery_type_combo.addItem("四节三元 (01)", 0x01)
+        self.battery_type_combo.addItem("四节铁锂 (02)", 0x02)
+        self.battery_type_combo.addItem("保留 (03)", 0x03)
+        bat_layout.addWidget(self.battery_type_combo)
+        self.btn_set_bat_type_all = QPushButton(tr('set_for_all_online'))
+        self.btn_set_bat_type_all.clicked.connect(self.on_set_battery_type_all)
+        bat_layout.addWidget(self.btn_set_bat_type_all)
+        control_layout.addLayout(bat_layout)
+
+        # 导出
+        self.btn_export_excel = QPushButton(tr('export_excel'))
+        self.btn_export_excel.clicked.connect(self.on_export_excel)
+        control_layout.addWidget(self.btn_export_excel)
+
+        # 单模块测试
+        self.group_test = QGroupBox(tr('single_module_test'))
+        test_layout = QVBoxLayout(self.group_test)
+        limit_layout = QHBoxLayout()
+        self.label_lower = QLabel(tr('lower_limit'))
+        limit_layout.addWidget(self.label_lower)
+        self.lower_limit_spin = QSpinBox()
+        self.lower_limit_spin.setRange(0, 100000)
+        self.lower_limit_spin.setValue(1800)
+        limit_layout.addWidget(self.lower_limit_spin)
+        self.label_upper = QLabel(tr('upper_limit'))
+        limit_layout.addWidget(self.label_upper)
+        self.upper_limit_spin = QSpinBox()
+        self.upper_limit_spin.setRange(0, 100000)
+        self.upper_limit_spin.setValue(2200)
+        limit_layout.addWidget(self.upper_limit_spin)
+        test_layout.addLayout(limit_layout)
+
+        self.btn_start_test = QPushButton(tr('start_test_on_selected'))
+        self.btn_start_test.clicked.connect(self.on_start_test)
+        test_layout.addWidget(self.btn_start_test)
+        self.btn_stop_test = QPushButton(tr('stop_test'))
+        self.btn_stop_test.clicked.connect(self.on_stop_test_clicked)
+        self.btn_stop_test.setEnabled(False)
+        test_layout.addWidget(self.btn_stop_test)
+        self.test_status_label = QLabel(tr('test_status'))
+        test_layout.addWidget(self.test_status_label)
+        control_layout.addWidget(self.group_test)
+
+        # 全局测试
+        self.group_global_test = QGroupBox(tr('global_test'))
+        global_test_layout = QVBoxLayout(self.group_global_test)
+        loop_btn_layout = QHBoxLayout()
+        self.btn_loop_test = QPushButton(tr('start_loop_test'))
+        self.btn_loop_test.clicked.connect(self.on_start_loop_test)
+        self.btn_stop_loop = QPushButton(tr('stop_loop_test'))
+        self.btn_stop_loop.clicked.connect(self.on_stop_loop_test)
+        self.btn_stop_loop.setEnabled(False)
+        loop_btn_layout.addWidget(self.btn_loop_test)
+        loop_btn_layout.addWidget(self.btn_stop_loop)
+        global_test_layout.addLayout(loop_btn_layout)
+
+        self.btn_global_test = QPushButton(tr('start_global_test'))
+        self.btn_global_test.clicked.connect(self.on_start_global_test)
+        global_test_layout.addWidget(self.btn_global_test)
+
+        self.global_test_status_label = QLabel(tr('global_test_status_idle'))
+        global_test_layout.addWidget(self.global_test_status_label)
+        control_layout.addWidget(self.group_global_test)
+
+        control_layout.addStretch()
+
+        self.left_panel = QScrollArea()
+        self.left_panel.setWidgetResizable(True)
+        self.left_panel.setWidget(self.group_control)
+        self.left_panel.setMinimumWidth(600)
+        self.left_panel.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.left_panel.setFrameShape(QFrame.NoFrame)
+        self.group_control.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.MinimumExpanding)
+
+        main_layout.addWidget(self.left_panel, 2)
+
+        # 右侧数据显示
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.label_current_data = QLabel(tr('current_data'))
+        right_layout.addWidget(self.label_current_data)
+        self.table = QTableWidget(MODULE_COUNT, 12)
+        self.table.setAlternatingRowColors(True)
+        # 列标题稍后在 retranslate_ui 中设置
+        right_layout.addWidget(self.table)
+
+        splitter = QSplitter(Qt.Vertical)
+        history_widget = QWidget()
+        history_layout = QVBoxLayout(history_widget)
+        self.label_history = QLabel(tr('cycle_history'))
+        history_layout.addWidget(self.label_history)
+        self.history_table = QTableWidget(MODULE_COUNT, 10)
+        self.history_table.setHorizontalHeaderLabels([f"Cycle {i+1}" for i in range(10)])
+        self.history_table.verticalHeader().setVisible(True)
+        for i in range(MODULE_COUNT):
+            self.history_table.setVerticalHeaderItem(i, QTableWidgetItem(str(i+1)))
+        self.history_table.setAlternatingRowColors(True)
+        history_layout.addWidget(self.history_table)
+        splitter.addWidget(history_widget)
+
+        log_btn_widget = QWidget()
+        log_btn_layout = QVBoxLayout(log_btn_widget)
+        self.btn_show_log = QPushButton(tr('show_comm_log'))
+        self.btn_show_log.clicked.connect(self.show_log_window)
+        log_btn_layout.addWidget(self.btn_show_log)
+        log_btn_layout.addStretch()
+        splitter.addWidget(log_btn_widget)
+
+        splitter.setSizes([550, 150])
+        right_layout.addWidget(splitter)
+        main_layout.addWidget(right_widget, 5)
+
+        # 定时器
+        self.table_timer = QTimer()
+        self.table_timer.timeout.connect(self.update_table)
+        self.table_timer.start(1000)
+
+        self.history_timer = QTimer()
+        self.history_timer.timeout.connect(self.update_history_table)
+        self.history_timer.start(2000)
+
+    # ---------- 辅助功能 ----------
+    def trigger_batch_read(self):
+        if self.serial_thread and self.serial_thread.ser and self.serial_thread.ser.is_open:
+            self.serial_thread.send_batch_read()
+
+    def add_cycle_record(self, module_idx, field, value):
+        recs = self.cycle_records[module_idx]
+        if not recs or (recs[-1].get('charge') is not None and recs[-1].get('discharge') is not None):
+            recs.append({'charge': None, 'discharge': None})
+        if len(recs) > 10:
+            recs.pop(0)
+        recs[-1][field] = value
+        self._update_history_cell(module_idx, len(recs) - 1, recs[-1])
+
+    def _update_history_cell(self, row, col, rec):
+        charge = rec.get("charge", "-")
+        discharge = rec.get("discharge", "-")
+        if charge is not None and discharge is not None:
+            text = f"{charge}/{discharge}"
+        elif charge is not None:
+            text = f"{charge}/-"
+        elif discharge is not None:
+            text = f"-/{discharge}"
+        else:
+            text = "/"
+        item = QTableWidgetItem(text)
+        item.setTextAlignment(Qt.AlignCenter)
+        self.history_table.setItem(row, col, item)
+
+    def send_command_reliable(self, cmd, addr, data=None):
+        if self.serial_thread and self.serial_thread.ser and self.serial_thread.ser.is_open:
+            self.serial_thread.send_command(cmd, addr, data)
+            time.sleep(0.02)
+
+    def abort_module_test(self, idx, state, reason):
+        addr = MODULE_ADDRS[idx]
+        self.send_command_reliable(CMD_STOP_CHARGE, addr)
+        self.send_command_reliable(CMD_STOP_DISCHARGE, addr)
+        state.completed = True
+        state.result = reason
+        self.global_test_results[idx] = {'result': reason, 'discharge': 0, 'charge2': 0}
+        self.check_all_completed()
+        self.on_log_message(tr('abort_test_reason', addr, reason))
+
+    def check_all_completed(self):
+        if self.loop_test_active:
+            return
+        if not self.global_test_mode:
+            return
+        if all(st.completed for st in self.module_test_states.values()):
+            self.on_log_message(tr('all_modules_completed'))
+            if self.loop_test_active:
+                self.on_loop_completed()
+            else:
+                self.stop_test(reset_ui=True)
+                QMessageBox.information(self, tr('information'), tr('global_test_complete_msg'))
+
+    def force_stop_no_battery_modules(self):
+        if not self.serial_thread or not self.serial_thread.ser or not self.serial_thread.ser.is_open:
+            return
+        for idx, state in self.module_test_states.items():
+            if state.no_battery:
+                mod = self.modules_data[idx]
+                if mod:
+                    chg_cur = mod.get('charge_current', 0)
+                    dchg_cur = mod.get('discharge_current', 0)
+                    if chg_cur > CURRENT_THRESHOLD or dchg_cur > CURRENT_THRESHOLD:
+                        self.serial_thread.send_command(CMD_STOP_CHARGE, MODULE_ADDRS[idx])
+                        self.serial_thread.send_command(CMD_STOP_DISCHARGE, MODULE_ADDRS[idx])
+
+    def check_ng_and_buzz(self):
+        if not self.serial_thread or not self.serial_thread.ser or not self.serial_thread.ser.is_open:
+            return
+        for idx in range(MODULE_COUNT):
+            result = self.global_test_results[idx]
+            if result and result.get('result') == 'NG':
+                if idx in self.online_modules:
+                    self.serial_thread.send_command(CMD_BUZZER_ON, MODULE_ADDRS[idx])
+                    self.ng_buzzer_set.add(idx)
+
+    def check_remaining_current(self):
+        if not self.serial_thread or not self.serial_thread.ser or not self.serial_thread.ser.is_open:
+            return
+        for idx, state in self.module_test_states.items():
+            if state.completed and not state.no_battery:
+                mod = self.modules_data[idx]
+                if mod:
+                    chg_cur = mod.get('charge_current', 0)
+                    dchg_cur = mod.get('discharge_current', 0)
+                    if chg_cur > CURRENT_THRESHOLD or dchg_cur > CURRENT_THRESHOLD:
+                        self.serial_thread.send_command(CMD_STOP_CHARGE, MODULE_ADDRS[idx])
+                        self.serial_thread.send_command(CMD_STOP_DISCHARGE, MODULE_ADDRS[idx])
+
+    def refresh_serial_ports(self):
+        ports = [port.device for port in serial.tools.list_ports.comports()]
+        self.port_combo.clear()
+        if ports:
+            self.port_combo.addItems(ports)
+        else:
+            self.port_combo.addItem(tr('no_ports_found'))
+
+    # ---------- 串口连接 ----------
+    def on_connect(self):
+        if self.serial_thread is None:
+            port = self.port_combo.currentText()
+            if port == tr('no_ports_found'):
+                QMessageBox.critical(self, tr('error'), tr('no_ports_found'))
+                return
+            baud = int(self.baud_combo.currentText())
+            self.serial_thread = SerialThread(port, baud)
+            self.serial_thread.data_received.connect(self.on_data_received)
+            self.serial_thread.error_occurred.connect(self.on_serial_error)
+            self.serial_thread.log_message.connect(self.on_log_message)
+            self.serial_thread.command_response.connect(self.on_command_response)
+            self.serial_thread.start()
+            self.btn_connect.setText(tr('disconnect'))
+            self.online_modules.clear()
+            self.batch_read_received = False
+            QTimer.singleShot(2000, self.send_default_commands)
+            self.batch_read_timer.start(500)
+        else:
+            self.batch_read_timer.stop()
+            self.test_stage_timer.stop()
+            self.buzzer_timer.stop()
+            self.current_check_timer.stop()
+            self.no_battery_stop_timer.stop()
+            self.serial_thread.stop()
+            self.serial_thread = None
+            self.btn_connect.setText(tr('connect'))
+            self.on_log_message(tr('disconnect'))
+
+    def send_default_commands(self):
+        if self.serial_thread is None:
+            return
+        wait_cycles = 0
+        while not self.batch_read_received and wait_cycles < 30:
+            QApplication.processEvents()
+            time.sleep(0.1)
+            wait_cycles += 1
+        if not self.online_modules:
+            self.on_log_message(tr('no_online_modules'))
+            return
+        bat_type = 0x00
+        cycle_num = 5
+        self.serial_thread.send_all_command(CMD_ALL_SET_BAT_TYPE, [bat_type])
+        QTimer.singleShot(20, lambda: self.serial_thread.send_all_command(CMD_ALL_SET_CYCLE_NUM, [cycle_num]))
+        for idx in self.online_modules:
+            self.set_cycle_nums[idx] = cycle_num
+        self.on_log_message(tr('default_settings_sent'))
+
+    def on_command_response(self, cmd, status, data):
+        cmd_name = CMD_NAMES.get(cmd, f"0x{cmd:02X}")
+        if status == 0:
+            msg = tr('command_succeeded', cmd_name)
+        else:
+            msg = tr('command_failed', cmd_name)
+        self.statusBar.showMessage(msg, 2000)
+        self.on_log_message(msg)
+
+    def on_emergency_stop(self):
+        if not self.serial_thread:
+            QMessageBox.warning(self, tr('warning'), tr('not_connected'))
+            return
+        reply = QMessageBox.question(self, tr('confirm'), tr('confirm_emergency_stop'),
+                                     QMessageBox.Yes | QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            self.serial_thread.send_all_command(CMD_ALL_EMERGENCY_STOP)
+            self.statusBar.showMessage(tr('emergency_stop_sent'), 3000)
+            self.on_log_message(tr('emergency_stop_sent'))
+            self.stop_test(reset_ui=True)
+
+    def on_stop_buzzer(self):
+        self.buzzer_timer.stop()
+        self.ng_buzzer_set.clear()
+        if self.serial_thread and self.serial_thread.ser and self.serial_thread.ser.is_open:
+            self.serial_thread.send_all_command(CMD_ALL_BUZZER_OFF)
+            self.on_log_message(tr('buzzers_off'))
+            self.statusBar.showMessage(tr('buzzers_off'), 2000)
+
+    def on_all_command(self, cmd):
+        mapping = {
+            CMD_START_CHARGE: CMD_ALL_START_CHARGE,
+            CMD_STOP_CHARGE: CMD_ALL_STOP_CHARGE,
+            CMD_START_DISCHARGE: CMD_ALL_START_DISCHARGE,
+            CMD_STOP_DISCHARGE: CMD_ALL_STOP_DISCHARGE,
+        }
+        self.serial_thread.send_all_command(mapping[cmd])
+
+    def on_set_cycle_num(self):
+        idx = self.module_combo.currentIndex()
+        addr = MODULE_ADDRS[idx]
+        num = self.cycle_spin.value()
+        if self.serial_thread:
+            self.serial_thread.send_command(CMD_SET_CYCLE_NUM, addr, [num])
+            self.set_cycle_nums[idx] = num
+            self.on_log_message(tr('set_cycle_num_module', addr, num))
+
+    def on_set_cycle_num_all(self):
+        num = self.cycle_spin.value()
+        if self.serial_thread:
+            self.serial_thread.send_all_command(CMD_ALL_SET_CYCLE_NUM, [num])
+            for i in range(MODULE_COUNT):
+                self.set_cycle_nums[i] = num
+            self.on_log_message(tr('set_cycle_num_all', num))
+
+    def on_set_battery_type_all(self):
+        if not self.serial_thread:
+            QMessageBox.warning(self, tr('warning'), tr('not_connected'))
+            return
+        bat_type = self.battery_type_combo.currentData()
+        if not self.online_modules:
+            QMessageBox.information(self, tr('information'), tr('no_online_modules'))
+            return
+        reply = QMessageBox.question(self, tr('confirm'),
+                                     tr('confirm_set_bat_type', bat_type),
+                                     QMessageBox.Yes | QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            self.serial_thread.send_all_command(CMD_ALL_SET_BAT_TYPE, [bat_type])
+            self.on_log_message(tr('set_bat_type_all'))
+
+    def on_export_excel(self):
+        try:
+            import openpyxl
+            from openpyxl.utils import get_column_letter
+        except ImportError:
+            QMessageBox.critical(self, tr('missing_library'), tr('install_openpyxl'))
+            return
+        file_path, _ = QFileDialog.getSaveFileName(self, tr('export_excel'), "", "Excel Files (*.xlsx)")
+        if not file_path:
+            return
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Cycle History"
+        headers = ["Module"] + [f"Cycle {i+1}" for i in range(10)] + ["QC Result", "Discharge(mAh)", "Charge2(mAh)"]
+        ws.append(headers)
+        for i in range(MODULE_COUNT):
+            row = [f"0x{MODULE_ADDRS[i]:02X}"]
+            records = self.cycle_records[i]
+            for col in range(10):
+                if col < len(records):
+                    rec = records[col]
+                    charge = rec.get('charge', '-')
+                    discharge = rec.get('discharge', '-')
+                    cell_value = f"{charge}/{discharge}" if charge != '-' or discharge != '-' else "/"
+                else:
+                    cell_value = "/"
+                row.append(cell_value)
+            result = self.global_test_results[i]
+            if result:
+                row.append(result.get('result', ''))
+                row.append(result.get('discharge', ''))
+                row.append(result.get('charge2', ''))
+            else:
+                row.extend(["", "", ""])
+            ws.append(row)
+        for col in ws.columns:
+            max_len = 0
+            col_letter = get_column_letter(col[0].column)
+            for cell in col:
+                try:
+                    if len(str(cell.value)) > max_len:
+                        max_len = len(str(cell.value))
+                except:
+                    pass
+            adjusted_width = min(max_len + 2, 30)
+            ws.column_dimensions[col_letter].width = adjusted_width
+        wb.save(file_path)
+        QMessageBox.information(self, tr('export_complete'), tr('export_path', file_path))
+
+    def show_log_window(self):
+        if self.log_window is None:
+            self.log_window = LogWindow(self)
+            self.log_window.closed.connect(self.on_log_window_closed)
+            if self.serial_thread:
+                self.serial_thread.log_message.disconnect(self.on_log_message)
+                self.serial_thread.log_message.connect(self.log_window.append_log)
+            self.log_window.show()
+        else:
+            self.log_window.raise_()
+            self.log_window.activateWindow()
+
+    def on_log_window_closed(self):
+        self.log_window = None
+        if self.serial_thread:
+            try:
+                self.serial_thread.log_message.disconnect()
+            except TypeError:
+                pass
+            self.serial_thread.log_message.connect(self.on_log_message)
+
+    # ---------- 数据处理 ----------
+    def on_data_received(self, modules):
+        for mod in modules:
+            idx = MODULE_ADDRS.index(mod['addr'])
+            self.modules_data[idx] = mod
+
+            curr_status = mod['status']
+            curr_charge_mah = mod['charge_mah']
+            curr_discharge_mah = mod['discharge_mah']
+
+            if (curr_status & 0x04) and not (self.last_status[idx] & 0x04):
+                self.on_alarm(tr('alarm_overcharge', MODULE_ADDRS[idx]))
+            if (curr_status & 0x08) and not (self.last_status[idx] & 0x08):
+                self.on_alarm(tr('alarm_overdischarge', MODULE_ADDRS[idx]))
+
+            if (curr_status & 0x01) and not (self.last_status[idx] & 0x01):
+                self.on_log_message(tr('charge_started', MODULE_ADDRS[idx]))
+            if not (curr_status & 0x01) and (self.last_status[idx] & 0x01):
+                self.on_log_message(tr('charge_stopped', MODULE_ADDRS[idx]))
+            if (curr_status & 0x02) and not (self.last_status[idx] & 0x02):
+                self.on_log_message(tr('discharge_started', MODULE_ADDRS[idx]))
+            if not (curr_status & 0x02) and (self.last_status[idx] & 0x02):
+                self.on_log_message(tr('discharge_stopped', MODULE_ADDRS[idx]))
+
+            self.last_status[idx] = curr_status
+            self.last_charge_mah[idx] = curr_charge_mah
+            self.last_discharge_mah[idx] = curr_discharge_mah
+            self.last_cycle[idx] = mod['cycle']
+
+        current_online = set()
+        for i, mod in enumerate(self.modules_data):
+            if mod is None:
+                continue
+            if (mod['voltage'] > 0 or mod['charge_current'] > 0 or
+                mod['discharge_current'] > 0 or mod['charge_mah'] > 0 or
+                mod['discharge_mah'] > 0 or mod['status'] != 0):
+                current_online.add(i)
+        self.online_modules = current_online
+        self.batch_read_received = True
+
+        # 状态机更新
+        if self.test_running and self.global_test_mode:
+            if self.loop_test_active:
+                for idx in list(self.module_test_states.keys()):
+                    state = self.module_test_states.get(idx)
+                    if isinstance(state, LoopModuleState) and not state.completed:
+                        mod = self.modules_data[idx]
+                        if mod:
+                            self.update_loop_state(idx, state, mod)
+            else:
+                for idx in list(self.module_test_states.keys()):
+                    state = self.module_test_states.get(idx)
+                    if isinstance(state, ModuleTestState) and not state.completed and not state.no_battery:
+                        mod = self.modules_data[idx]
+                        if mod:
+                            self.update_module_test_state(idx, state, mod)
+
+        self.update_table()
+
+    def update_loop_state(self, idx, state, mod):
+        if state.completed:
+            return
+        status = mod['status']
+        addr = MODULE_ADDRS[idx]
+
+        if state.stage == STAGE_CHARGE1:
+            if status & 0x10:   # 充电完成
+                self.send_command_reliable(CMD_STOP_CHARGE, addr)
+                time.sleep(0.05)
+                state.stage = STAGE_DISCHARGE
+                state.charge_end = mod['charge_mah']
+                state.discharge_start = mod['discharge_mah']
+                self.send_command_reliable(CMD_START_DISCHARGE, addr)
+        elif state.stage == STAGE_DISCHARGE:
+            if status & 0x20:   # 放电完成
+                self.send_command_reliable(CMD_STOP_DISCHARGE, addr)
+                time.sleep(0.05)
+                disc = mod['discharge_mah'] - state.discharge_start
+                self.add_cycle_record(idx, 'discharge', disc)
+                state.current_cycle += 1
+                if state.current_cycle >= state.total_cycles:
+                    state.completed = True
+                    self.send_command_reliable(CMD_STOP_CHARGE, addr)
+                    self.send_command_reliable(CMD_STOP_DISCHARGE, addr)
+                    self.on_log_message(tr('module_completed_cycles', addr, state.total_cycles))
+                    self.check_loop_all_completed()
+                else:
+                    state.stage = STAGE_CHARGE1
+                    state.charge_start = mod['charge_mah']
+                    self.send_command_reliable(CMD_START_CHARGE, addr)
+
+    def check_loop_all_completed(self):
+        if not self.loop_test_active:
+            return
+        if all(state.completed for state in self.module_test_states.values()):
+            self.on_log_message(tr('all_modules_completed_loop'))
+            self.stop_loop_test(final_stop=True)
+
+    def update_module_test_state(self, idx, state, mod):
+        if state.no_battery or state.completed:
+            return
+        addr = MODULE_ADDRS[idx]
+        status = mod['status']
+        lower = state.lower_limit
+        upper = state.upper_limit
+
+        if status & 0x04:
+            self.on_log_message(tr('alarm_overcharge', addr))
+            self.abort_module_test(idx, state, 'NG')
+            return
+        if status & 0x08:
+            self.on_log_message(tr('alarm_overdischarge', addr))
+            self.abort_module_test(idx, state, 'NG')
+            return
+
+        if state.stage == STAGE_CHARGE1:
+            if status & 0x10:
+                self.on_log_message(tr('charge1_completed', addr))
+                self.send_command_reliable(CMD_STOP_CHARGE, addr)
+                time.sleep(0.05)
+                state.stage = STAGE_DISCHARGE
+                state.charge_end = mod['charge_mah']
+                state.discharge_start = mod['discharge_mah']
+                state.discharge_max = mod['discharge_mah']
+                self.send_command_reliable(CMD_START_DISCHARGE, addr)
+                self.on_log_message(tr('discharge_started', addr))
+                return
+        elif state.stage == STAGE_DISCHARGE:
+            if status & 0x20:
+                self.on_log_message(tr('discharge_completed', addr))
+                self.send_command_reliable(CMD_STOP_DISCHARGE, addr)
+                time.sleep(0.05)
+                discharged = state.discharge_max - state.discharge_start
+                if discharged < 1:
+                    state.no_battery = True
+                    state.completed = True
+                    state.result = 'NO_BAT'
+                    self.global_test_results[idx] = {'result': 'NO_BAT', 'discharge': 0, 'charge2': 0}
+                    self.send_command_reliable(CMD_STOP_CHARGE, addr)
+                    self.send_command_reliable(CMD_STOP_DISCHARGE, addr)
+                    self.check_all_completed()
+                    return
+                state.discharge_cap = discharged
+                self.add_cycle_record(idx, 'discharge', discharged)
+                state.stage = STAGE_CHARGE2
+                state.charge2_start = mod['charge_mah']
+                state.charge2_max = mod['charge_mah']
+                self.send_command_reliable(CMD_START_CHARGE, addr)
+                self.on_log_message(tr('discharge_done', addr, discharged))
+                return
+        elif state.stage == STAGE_CHARGE2:
+            if status & 0x10:
+                self.on_log_message(tr('charge2_completed', addr))
+                self.send_command_reliable(CMD_STOP_CHARGE, addr)
+                time.sleep(0.05)
+                charged = state.charge2_max - state.charge2_start
+                if charged < 1:
+                    self.on_log_message(tr('charge2_empty_retry', addr))
+                    self.send_command_reliable(CMD_START_CHARGE, addr)
+                    return
+                state.charge2_cap = charged
+                self.add_cycle_record(idx, 'charge', charged)
+                ok = (lower <= state.discharge_cap <= upper) and (lower <= state.charge2_cap <= upper)
+                result = "OK" if ok else "NG"
+                self.global_test_results[idx] = {
+                    'result': result,
+                    'discharge': state.discharge_cap,
+                    'charge2': state.charge2_cap
+                }
+                state.result = result
+                state.stage = STAGE_COMPLETED
+                state.completed = True
+                self.send_command_reliable(CMD_STOP_CHARGE, addr)
+                self.send_command_reliable(CMD_STOP_DISCHARGE, addr)
+                self.on_log_message(tr('test_finished_result', addr, result))
+                self.check_all_completed()
+                return
+
+        if state.stage == STAGE_CHARGE1 and (status & 0x01):
+            if mod['charge_mah'] > state.charge1_max:
+                state.charge1_max = mod['charge_mah']
+        elif state.stage == STAGE_DISCHARGE and (status & 0x02):
+            if mod['discharge_mah'] > state.discharge_max:
+                state.discharge_max = mod['discharge_mah']
+        elif state.stage == STAGE_CHARGE2 and (status & 0x01):
+            if mod['charge_mah'] > state.charge2_max:
+                state.charge2_max = mod['charge_mah']
+
+    def on_test_timeout(self):
+        if not self.test_running:
+            return
+        self.on_log_message(tr('test_timeout'))
+        self.stop_test(reset_ui=True)
+        QMessageBox.critical(self, tr('error'), tr('test_timeout'))
+
+    def stop_test(self, reset_ui=True):
+        if not self.test_running and reset_ui:
+            return
+        self.test_running = False
+        self.global_test_mode = False
+        self.test_stage_timer.stop()
+        self.buzzer_timer.stop()
+        self.current_check_timer.stop()
+        self.no_battery_stop_timer.stop()
+
+        if self.serial_thread and self.serial_thread.ser and self.serial_thread.ser.is_open:
+            self.serial_thread.send_all_command(CMD_ALL_BUZZER_OFF)
+            self.serial_thread.send_all_command(CMD_ALL_EMERGENCY_STOP)
+            self.on_log_message(tr('stop_all_modules'))
+
+        if reset_ui:
+            self.test_status_label.setText(tr('test_status'))
+            self.global_test_status_label.setText(tr('global_test_status_idle'))
+            self.btn_start_test.setText(tr('start_test_on_selected'))
+            self.btn_stop_test.setEnabled(False)
+            self.set_controls_enabled(True)
+            self.btn_global_test.setEnabled(True)
+            self.btn_start_test.setEnabled(True)
+            self.btn_loop_test.setEnabled(True)
+            self.btn_stop_loop.setEnabled(False)
+
+        self.module_test_states.clear()
+        self.single_test_state = None
+        self.update_table()
+
+    def set_controls_enabled(self, enabled):
+        self.btn_start_charge.setEnabled(enabled)
+        self.btn_stop_charge.setEnabled(enabled)
+        self.btn_start_discharge.setEnabled(enabled)
+        self.btn_stop_discharge.setEnabled(enabled)
+        self.btn_all_start_charge.setEnabled(enabled)
+        self.btn_all_stop_charge.setEnabled(enabled)
+        self.btn_all_start_discharge.setEnabled(enabled)
+        self.btn_all_stop_discharge.setEnabled(enabled)
+        self.btn_set_cycle.setEnabled(enabled)
+        self.btn_set_cycle_all.setEnabled(enabled)
+        self.btn_set_bat_type_all.setEnabled(enabled)
+        self.btn_export_excel.setEnabled(enabled)
+        self.btn_emergency_stop.setEnabled(enabled)
+        self.btn_stop_buzzer.setEnabled(True)
+
+    def on_start_global_test(self):
+        if not self.serial_thread:
+            QMessageBox.warning(self, tr('warning'), tr('not_connected'))
+            return
+        if self.test_running:
+            QMessageBox.warning(self, tr('warning'), tr('test_running'))
+            return
+        if not self.online_modules:
+            QMessageBox.warning(self, tr('warning'), tr('no_online_modules'))
+            return
+        self.cycle_records = [[] for _ in range(MODULE_COUNT)]
+        self.global_test_results = [None] * MODULE_COUNT
+        self.update_table()
+        self.update_history_table()
+        lower = self.lower_limit_spin.value()
+        upper = self.upper_limit_spin.value()
+        reply = QMessageBox.question(self, tr('confirm'),
+                                     tr('confirm_start_global_test', len(self.online_modules), lower, upper),
+                                     QMessageBox.Yes | QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+
+        self.global_test_mode = True
+        self.test_running = True
+        self.module_test_states.clear()
+        self.global_test_results = [None] * MODULE_COUNT
+
+        for idx in self.online_modules:
+            mod = self.modules_data[idx]
+            if mod is None:
+                continue
+            state = ModuleTestState(idx, lower, upper)
+            state.start(mod['charge_mah'], mod['discharge_mah'])
+            self.module_test_states[idx] = state
+
+        self.serial_thread.send_all_command(CMD_ALL_EMERGENCY_STOP)
+        QTimer.singleShot(200, lambda: self.serial_thread.send_all_command(CMD_ALL_START_CHARGE))
+
+        self.set_controls_enabled(False)
+        self.btn_stop_test.setEnabled(True)
+        self.btn_global_test.setEnabled(False)
+        self.btn_start_test.setEnabled(False)
+        self.btn_loop_test.setEnabled(False)
+
+        self.global_test_status_label.setText(tr('global_test_independent'))
+        self.test_status_label.setText(tr('test_running_global'))
+        self.no_battery_stop_timer.start()
+        self.on_log_message(tr('global_test_started', len(self.module_test_states)))
+
+    def on_start_test(self):
+        self.cycle_records = [[] for _ in range(MODULE_COUNT)]
+        self.global_test_results = [None] * MODULE_COUNT
+        self.update_table()
+        self.update_history_table()
+        if not self.serial_thread:
+            QMessageBox.warning(self, tr('warning'), tr('not_connected'))
+            return
+        if self.test_running:
+            reply = QMessageBox.question(self, tr('confirm'), tr('test_running') + "\n" + tr('confirm_stop_test'),
+                                         QMessageBox.Yes | QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                self.stop_test(reset_ui=True)
+            return
+
+        idx = self.module_combo.currentIndex()
+        addr = MODULE_ADDRS[idx]
+        if self.modules_data[idx] is None:
+            QMessageBox.warning(self, tr('warning'), tr('module_no_data', addr))
+            return
+
+        lower = self.lower_limit_spin.value()
+        upper = self.upper_limit_spin.value()
+        reply = QMessageBox.question(self, tr('confirm'), tr('confirm_start_test', addr),
+                                     QMessageBox.Yes | QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+
+        self.global_test_mode = True
+        self.test_running = True
+        self.module_test_states.clear()
+        self.global_test_results = [None] * MODULE_COUNT
+
+        mod = self.modules_data[idx]
+        state = ModuleTestState(idx, lower, upper)
+        state.start(mod['charge_mah'], mod['discharge_mah'])
+        self.module_test_states[idx] = state
+
+        self.serial_thread.send_command(CMD_STOP_CHARGE, addr)
+        self.serial_thread.send_command(CMD_STOP_DISCHARGE, addr)
+        QTimer.singleShot(200, lambda: self.serial_thread.send_command(CMD_START_CHARGE, addr))
+
+        self.test_status_label.setText(tr('single_test_first_charge', addr))
+        self.set_controls_enabled(False)
+        self.btn_stop_test.setEnabled(True)
+        self.btn_start_test.setText(tr('stop_test'))
+        self.btn_global_test.setEnabled(False)
+        self.btn_loop_test.setEnabled(False)
+        self.no_battery_stop_timer.start()
+        self.on_log_message(tr('single_test_started', addr))
+
+    def on_stop_test_clicked(self):
+        if self.test_running:
+            reply = QMessageBox.question(self, tr('confirm'), tr('confirm_stop_test'),
+                                         QMessageBox.Yes | QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                self.stop_test(reset_ui=True)
+
+    def on_start_loop_test(self):
+        if not self.serial_thread:
+            QMessageBox.warning(self, tr('warning'), tr('not_connected'))
+            return
+        if self.test_running:
+            QMessageBox.warning(self, tr('warning'), tr('test_running'))
+            return
+        if not self.online_modules:
+            QMessageBox.warning(self, tr('warning'), tr('no_online_modules'))
+            return
+
+        total = self.cycle_spin.value()
+        if total < 1:
+            QMessageBox.warning(self, tr('warning'), tr('cycle_num_warning'))
+            return
+
+        reply = QMessageBox.question(self, tr('confirm'),
+                                     tr('confirm_start_loop', len(self.online_modules), total),
+                                     QMessageBox.Yes | QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+
+        self.loop_test_active = True
+        self.test_running = True
+        self.global_test_mode = True
+        self.loop_total_cycles = total
+        self.loop_current_cycle = 0
+
+        self.cycle_records = [[] for _ in range(MODULE_COUNT)]
+        self.global_test_results = [None] * MODULE_COUNT
+
+        self.module_test_states.clear()
+        for idx in self.online_modules:
+            mod = self.modules_data[idx]
+            if mod is None:
+                continue
+            state = LoopModuleState(idx, total)
+            state.start(mod['charge_mah'], mod['discharge_mah'])
+            self.module_test_states[idx] = state
+
+        self.serial_thread.send_all_command(CMD_ALL_EMERGENCY_STOP)
+        QTimer.singleShot(200, lambda: self.serial_thread.send_all_command(CMD_ALL_START_CHARGE))
+
+        self.set_controls_enabled(False)
+        self.btn_global_test.setEnabled(False)
+        self.btn_start_test.setEnabled(False)
+        self.btn_loop_test.setEnabled(False)
+        self.btn_stop_loop.setEnabled(True)
+        self.btn_stop_test.setEnabled(False)
+
+        self.global_test_status_label.setText(tr('loop_test_status', 0, total))
+        self.test_status_label.setText(tr('loop_test_running'))
+        self.on_log_message(tr('loop_test_started', total))
+
+    def on_stop_loop_test(self):
+        if self.loop_test_active:
+            reply = QMessageBox.question(self, tr('confirm'), tr('confirm_stop_loop'),
+                                         QMessageBox.Yes | QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                self.stop_loop_test(final_stop=False)
+
+    def on_loop_completed(self):
+        if not self.loop_test_active:
+            return
+        self.update_history_table()
+        if self.loop_current_cycle < self.loop_total_cycles:
+            self.serial_thread.send_all_command(CMD_ALL_EMERGENCY_STOP)
+            QTimer.singleShot(500, self.start_next_cycle)
+        else:
+            self.on_log_message(tr('loop_completed'))
+            self.serial_thread.send_all_command(CMD_ALL_EMERGENCY_STOP)
+            QTimer.singleShot(500, lambda: self.stop_loop_test(final_stop=True))
+            self.global_test_status_label.setText(tr('loop_test_status', self.loop_total_cycles, self.loop_total_cycles))
+
+    def start_next_cycle(self):
+        if not self.loop_test_active:
+            return
+        self.loop_current_cycle += 1
+        self.global_test_status_label.setText(tr('loop_test_status', self.loop_current_cycle, self.loop_total_cycles))
+        self.on_log_message(f"Starting loop cycle {self.loop_current_cycle}/{self.loop_total_cycles}")
+
+        self.module_test_states.clear()
+        for idx in self.online_modules:
+            mod = self.modules_data[idx]
+            if mod is None:
+                continue
+            state = LoopModuleState(idx, self.loop_total_cycles)
+            state.start(mod['charge_mah'], mod['discharge_mah'])
+            state.current_cycle = self.loop_current_cycle - 1  # 保持已完成循环数
+            self.module_test_states[idx] = state
+
+        self.serial_thread.send_all_command(CMD_ALL_EMERGENCY_STOP)
+        QTimer.singleShot(200, lambda: self.serial_thread.send_all_command(CMD_ALL_START_CHARGE))
+
+    def stop_loop_test(self, final_stop=False):
+        if not self.loop_test_active and not final_stop:
+            return
+
+        self.loop_test_active = False
+        self.test_running = False
+        self.global_test_mode = False
+
+        if self.serial_thread and self.serial_thread.ser and self.serial_thread.ser.is_open:
+            self.serial_thread.send_all_command(CMD_ALL_EMERGENCY_STOP)
+            self.serial_thread.send_all_command(CMD_ALL_BUZZER_OFF)
+
+        self.set_controls_enabled(True)
+        self.btn_global_test.setEnabled(True)
+        self.btn_start_test.setEnabled(True)
+        self.btn_loop_test.setEnabled(True)
+        self.btn_stop_loop.setEnabled(False)
+        self.global_test_status_label.setText(tr('global_test_status_idle'))
+        self.test_status_label.setText(tr('test_status'))
+        self.test_stage_timer.stop()
+
+        self.module_test_states.clear()
+        self.update_table()
+
+        if final_stop:
+            QMessageBox.information(self, tr('information'), tr('loop_completed_msg', self.loop_total_cycles))
+        else:
+            QMessageBox.information(self, tr('information'), tr('loop_stopped_user'))
+
+    def update_table(self):
+        for i in range(MODULE_COUNT):
+            mod = self.modules_data[i]
+            if mod is None:
+                continue
+            status_str = ""
+            if mod['status'] & 0x01:
+                status_str += tr('charge_started_short', default="Charging ")
+            if mod['status'] & 0x02:
+                status_str += tr('discharge_started_short', default="Discharging ")
+            if mod['status'] & 0x04:
+                status_str += tr('overcharge_alarm_short', default="Overcharge Alarm ")
+            if mod['status'] & 0x08:
+                status_str += tr('overdischarge_alarm_short', default="Overdischarge Alarm ")
+            if mod['status'] & 0x10:
+                status_str += tr('charge_complete_short', default="ChargeComplete ")
+            if mod['status'] & 0x20:
+                status_str += tr('discharge_complete_short', default="DischargeComplete ")
+            if not status_str:
+                status_str = tr('idle_status', default="Idle")
+
+            set_cycle = self.set_cycle_nums[i]
+            current_cycle = mod['cycle']
+            test_status = ""
+            if set_cycle > 0:
+                if current_cycle >= set_cycle:
+                    test_status = tr('completed_status', current_cycle, set_cycle)
+                else:
+                    if mod['status'] & 0x01:
+                        test_status = tr('charging_status', current_cycle+1, set_cycle)
+                    elif mod['status'] & 0x02:
+                        test_status = tr('discharging_status', current_cycle+1, set_cycle)
+                    else:
+                        test_status = tr('idle_cycle_status', current_cycle, set_cycle)
+            else:
+                test_status = tr('cycle_not_set')
+
+            if self.loop_test_active and i in self.module_test_states:
+                state = self.module_test_states[i]
+                if isinstance(state, LoopModuleState):
+                    test_status = tr('loop_status', state.current_cycle, state.total_cycles)
+                else:
+                    test_status = "Loop: -"
+
+            alarm_type = ""
+            if mod['status'] & 0x04:
+                alarm_type = tr('overcharge_alarm_short')
+            elif mod['status'] & 0x08:
+                alarm_type = tr('overdischarge_alarm_short')
+
+            qc_result = ""
+            test_caps = ""
+            row_color = QColor(255, 255, 255)
+
+            if self.global_test_results[i]:
+                result = self.global_test_results[i]
+                qc_result = result['result']
+                if qc_result == "OK":
+                    row_color = QColor(200, 255, 200)
+                elif qc_result == "NG":
+                    row_color = QColor(255, 200, 200)
+                    if alarm_type:
+                        alarm_type += " + Capacity NG"
+                    else:
+                        alarm_type = "Capacity NG"
+                elif qc_result == "NO_BAT":
+                    qc_result = tr('no_battery')
+                    row_color = QColor(220, 220, 220)
+                discharge = result.get('discharge', 0)
+                charge2 = result.get('charge2', 0)
+                test_caps = f"D:{discharge} C:{charge2}"
+
+            if (mod['status'] & 0x04) or (mod['status'] & 0x08):
+                row_color = QColor(255, 200, 200)
+
+            self.table.setItem(i, 0, QTableWidgetItem(f"0x{MODULE_ADDRS[i]:02X}"))
+            self.table.setItem(i, 1, QTableWidgetItem(str(mod['voltage'])))
+            self.table.setItem(i, 2, QTableWidgetItem(str(mod['charge_current'])))
+            self.table.setItem(i, 3, QTableWidgetItem(str(mod['discharge_current'])))
+            self.table.setItem(i, 4, QTableWidgetItem(str(mod['charge_mah'])))
+            self.table.setItem(i, 5, QTableWidgetItem(str(mod['discharge_mah'])))
+            self.table.setItem(i, 6, QTableWidgetItem(status_str))
+            self.table.setItem(i, 7, QTableWidgetItem(str(mod['cycle'])))
+            self.table.setItem(i, 8, QTableWidgetItem(test_status))
+            self.table.setItem(i, 9, QTableWidgetItem(qc_result))
+            self.table.setItem(i, 10, QTableWidgetItem(test_caps))
+            self.table.setItem(i, 11, QTableWidgetItem(alarm_type))
+
+            for col in range(12):
+                item = self.table.item(i, col)
+                if item:
+                    item.setBackground(row_color)
+
+        self.table.resizeColumnsToContents()
+
+    def update_history_table(self):
+        self.history_table.setRowCount(MODULE_COUNT)
+        for i in range(MODULE_COUNT):
+            records = self.cycle_records[i]
+            for col in range(10):
+                if col < len(records):
+                    rec = records[col]
+                    charge = rec.get('charge', '-')
+                    discharge = rec.get('discharge', '-')
+                    if charge is not None and discharge is not None:
+                        text = f"{charge}/{discharge}"
+                    elif charge is not None:
+                        text = f"{charge}/-"
+                    elif discharge is not None:
+                        text = f"-/{discharge}"
+                    else:
+                        text = "/"
+                else:
+                    text = "/"
+                item = QTableWidgetItem(text)
+                item.setTextAlignment(Qt.AlignCenter)
+                self.history_table.setItem(i, col, item)
+        self.history_table.resizeColumnsToContents()
+
+    def on_alarm(self, message):
+        self.on_log_message(message)
+        if self.test_running:
+            return
+        now = time.time()
+        if now - self.last_alarm_time > 60:
+            self.last_alarm_time = now
+            QMessageBox.warning(self, tr('warning'), message)
+
+    def on_serial_error(self, err):
+        QMessageBox.critical(self, tr('error'), err)
+
+    def on_single_command(self, cmd):
+        idx = self.module_combo.currentIndex()
+        addr = MODULE_ADDRS[idx]
+        if self.serial_thread:
+            self.serial_thread.send_command(cmd, addr)
+
+    def on_log_message(self, msg):
+        if self.log_window:
+            self.log_window.append_log(msg)
+        else:
+            # 也可输出到状态栏或控制台
+            pass
+
+    def closeEvent(self, event):
+        self.test_stage_timer.stop()
+        self.buzzer_timer.stop()
+        self.current_check_timer.stop()
+        self.no_battery_stop_timer.stop()
+        if self.serial_thread:
+            self.serial_thread.stop()
+        if self.log_window:
+            self.log_window.close()
+        event.accept()
+
+
+if __name__ == "__main__":
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    app = QApplication(sys.argv)
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec_())

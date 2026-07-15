@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Keil/C51 generated files
+stc8h/Objects/
+stc8h/Listings/
+*.obj
+*.lst
+*.m51
+*.lnp
+*.hex
+*.htm
+*.map
+*.build_log.htm
+*.uvgui.*
+*.uvopt
+*.uvoptx
+
+# Local build/test logs
+*.log
+
+# Local/editor state
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
