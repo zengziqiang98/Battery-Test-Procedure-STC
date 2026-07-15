@@ -29,10 +29,10 @@ static void Bridge_GPIO_config(void)
     g.Pin = GPIO_Pin_4 | GPIO_Pin_5 | GPIO_Pin_6 | GPIO_Pin_7;
     GPIO_Inilize(GPIO_P2, &g);
 
-    /* UART1 P3.0/P3.1 */
+    /* UART2 P1.0/P1.1 */
     g.Mode = GPIO_PullUp;
     g.Pin = GPIO_Pin_0 | GPIO_Pin_1;
-    GPIO_Inilize(GPIO_P3, &g);
+    GPIO_Inilize(GPIO_P1, &g);
 
     /* IIC master P1.4/P1.5 */
     g.Mode = GPIO_OUT_OD;
@@ -44,13 +44,13 @@ void UART_config(void)
 {
     COMx_InitDefine s;
     s.UART_Mode=UART_8bit_BRTx;
-    s.UART_BRT_Use=BRT_Timer1;
+    s.UART_BRT_Use=BRT_Timer2;
     s.UART_BaudRate=256000ul;
     s.UART_RxEnable=ENABLE;
     s.BaudRateDouble=DISABLE;
-    UART_Configuration(UART1,&s);
-    NVIC_UART1_Init(ENABLE,Priority_1);
-    UART1_SW(UART1_SW_P30_P31);
+    UART_Configuration(UART2,&s);
+    NVIC_UART2_Init(ENABLE,Priority_1);
+    UART2_SW(UART2_SW_P10_P11);
 }
 
 void XOSC_Init(void)
@@ -65,7 +65,7 @@ void XOSC_Init(void)
 static void print_ready(void)
 {
     char *p="BRIDGE\r\n";
-    while(*p){SBUF=*p++;while(!TI);TI=0;}
+    while(*p) TX2_write2buff(*p++);
 }
 
 void main(void)
@@ -85,12 +85,12 @@ void main(void)
         Protocol_Poll();
         Protocol_Background();
 
-        if(COM1.RX_TimeOut>0)
+        if(COM2.RX_TimeOut>0)
         {
-            if(--COM1.RX_TimeOut==0 && COM1.RX_Cnt>0)
+            if(--COM2.RX_TimeOut==0 && COM2.RX_Cnt>0)
             {
                 Protocol_Poll();
-                COM1.RX_Cnt=0;
+                COM2.RX_Cnt=0;
             }
         }
     }

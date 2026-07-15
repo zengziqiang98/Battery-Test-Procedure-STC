@@ -50,7 +50,7 @@ static unsigned char xor_bytes(unsigned char *buf, unsigned char len)
 static void send_buf(unsigned char *buf, unsigned char len)
 {
     unsigned char i;
-    for (i = 0; i < len; i++) TX1_write2buff(buf[i]);
+    for (i = 0; i < len; i++) TX2_write2buff(buf[i]);
 }
 
 static unsigned char read_bridge_hw_addr(void)
@@ -367,19 +367,19 @@ void Protocol_Poll(void)
 {
     unsigned char len, expected;
 
-    if (COM1.RX_Cnt < 4) return;
+    if (COM2.RX_Cnt < 4) return;
 
-    len = RX1_Buffer[2];
+    len = RX2_Buffer[2];
     if (len > 124) {
-        COM1.RX_Cnt = 0;
+        COM2.RX_Cnt = 0;
         return;
     }
     expected = 4 + len;
-    if (COM1.RX_Cnt < expected) return;
+    if (COM2.RX_Cnt < expected) return;
 
-    handle_frame(RX1_Buffer, expected);
+    handle_frame(RX2_Buffer, expected);
     cache_cooldown = CACHE_AFTER_SERIAL_COOLDOWN_TICKS;
-    COM1.RX_Cnt = 0;
+    COM2.RX_Cnt = 0;
 }
 
 void Protocol_Background(void)
@@ -387,7 +387,7 @@ void Protocol_Background(void)
     unsigned short reg;
     unsigned short val;
 
-    if (COM1.RX_Cnt > 0) return;
+    if (COM2.RX_Cnt > 0) return;
 
     if (cache_cooldown > 0) {
         cache_cooldown--;
