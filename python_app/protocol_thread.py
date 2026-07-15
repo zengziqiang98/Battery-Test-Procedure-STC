@@ -33,6 +33,7 @@ class ProtocolThread(QThread):
         self.port, self.baudrate = port, baudrate
         self._s = None; self.running = False
         self._cmd_queue = deque()  # 命令队列: (func, args, kwargs)
+        self._cmd_lock = threading.Lock()
         self._round = 0; self._active = set(); self._offline = {}
 
     def run(self):
@@ -113,10 +114,20 @@ class ProtocolThread(QThread):
 
     def _drain_commands(self):
         """发送队列中所有待发命令"""
-        while self._cmd_queue:
-            func, args, kwargs = self._cmd_queue.popleft()
-            try: func(*args, **kwargs)
-            except: pass
+        while True:
+            with self._cmd_lock:
+                if not self._cmd_queue:
+                    return
+                item = self._cmd_queue.popleft()
+            func, args, kwargs, done, result = item
+            try:
+                status = func(*args, **kwargs)
+            except Exception:
+                status = -1
+            if result is not None:
+                result["status"] = status
+            if done is not None:
+                done.set()
 
     def _read_reply_nonblocking(self, expected_len, timeout_sec):
         resp = bytearray()
@@ -169,40 +180,70 @@ class ProtocolThread(QThread):
         if isinstance(m, tuple):
             _, ra, bc = m
             v = data[0] if data and bc == 1 else ((data[0] << 8) | data[1]) if data and bc == 2 else 0
-            self._cmd_queue.append((self._write_raw, (addr, ra, v), {}))
+            with self._cmd_lock:
+                self._cmd_queue.append((self._write_raw, (addr, ra, v), {}, None, None))
         else:
-            self._cmd_queue.append((self._cmd_raw, (addr, m), {}))
+            with self._cmd_lock:
+                self._cmd_queue.append((self._cmd_raw, (addr, m), {}, None, None))
 
     def send_all_command(self, cmd_code, data=None):
         m = _BCAST_MAP.get(cmd_code, cmd_code)
         if isinstance(m, tuple):
             _, ra, bc = m
             v = data[0] if data and bc == 1 else 0
-            self._cmd_queue.append((self._write_raw, (0, ra, v), {}))
+            with self._cmd_lock:
+                self._cmd_queue.append((self._write_raw, (0, ra, v), {}, None, None))
         else:
-            self._cmd_queue.append((self._cmd_raw, (0, m), {}))
+            with self._cmd_lock:
+                self._cmd_queue.append((self._cmd_raw, (0, m), {}, None, None))
 
     def send_command_sync(self, cmd_code, addr, data=None, timeout_ms=300):
-        """Queue command. Compatible return: 0=queued, -1=serial unavailable."""
+        """Queue command and wait for the bridge status. Returns 0=OK, 0xFF=fail, -1=timeout/unavailable."""
         if self._s is None or not self._s.is_open:
             return -1
-        self.send_command(cmd_code, addr, data)
-        if timeout_ms:
-            time.sleep(timeout_ms / 1000.0)
-        return 0
+        m = _OLD_CMD_MAP.get(cmd_code, cmd_code)
+        done = threading.Event()
+        result = {"status": -1}
+        if isinstance(m, tuple):
+            _, ra, bc = m
+            v = data[0] if data and bc == 1 else ((data[0] << 8) | data[1]) if data and bc == 2 else 0
+            item = (self._write_raw, (addr, ra, v), {}, done, result)
+        else:
+            item = (self._cmd_raw, (addr, m), {}, done, result)
+        with self._cmd_lock:
+            self._cmd_queue.append(item)
+        if not done.wait(timeout_ms / 1000.0):
+            return -1
+        return result["status"]
 
     def _cmd_raw(self, addr, cmd):
         f = bytearray([addr, cmd, 0]); f.append(xor_checksum(f))
         self._s.timeout = 0.03
         self._s.write(f); self._s.flush()
-        if addr != 0: self._s.read(5)
+        if addr == 0:
+            return 0
+        resp = self._s.read(5)
+        if len(resp) != 5 or resp[0] != addr or resp[1] != (cmd | 0x80):
+            return -1
+        if xor_checksum(resp[:-1]) != resp[-1]:
+            return -1
+        self.command_response.emit(cmd, resp[2], b"")
+        return resp[2]
 
     def _write_raw(self, addr, reg, val):
         d = bytes([(reg>>8)&0xFF, reg&0xFF, (val>>8)&0xFF, val&0xFF])
         f = bytearray([addr, CMD_WRITE, len(d)]); f.extend(d); f.append(xor_checksum(f))
         self._s.timeout = 0.03
         self._s.write(f); self._s.flush()
-        if addr != 0: self._s.read(5)
+        if addr == 0:
+            return 0
+        resp = self._s.read(5)
+        if len(resp) != 5 or resp[0] != addr or resp[1] != (CMD_WRITE | 0x80):
+            return -1
+        if xor_checksum(resp[:-1]) != resp[-1]:
+            return -1
+        self.command_response.emit(CMD_WRITE, resp[2], b"")
+        return resp[2]
 
     send_batch_read = lambda self: None
 

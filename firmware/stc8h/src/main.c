@@ -217,8 +217,8 @@ static void bat_process(void)
     case STATE_IDLE:CHG_LED=0;DISCHG_LED=0;chg_overc_waiting=0;dischg_overd_waiting=0;curCycleNum=0;break;
     case STATE_CHARGING:CHG_LED=1;DISCHG_LED=0;if((TimeStamp_GetTick()-charge_start_tick)<50000)break;if(curBatVolt>=overchargeProtectVolt&&curChargeCurrentMA>300){if(!chg_overc_waiting){chg_overc_waiting=1;chg_overc_wait_start_tick=TimeStamp_GetTick();}else if((TimeStamp_GetTick()-chg_overc_wait_start_tick)>=OVER_VOLT_CONFIRM_MS){CHARGE_CTRL=0;current_state=STATE_IDLE;chg_overc_waiting=0;}}else chg_overc_waiting=0;if(curChargeCurrentMA<=300){if(!chg_complete_waiting){chg_complete_waiting=1;chg_complete_wait_start_tick=TimeStamp_GetTick();}else if((TimeStamp_GetTick()-chg_complete_wait_start_tick)>=CHG_COMPLETE_CONFIRM_MS){CHARGE_CTRL=0;current_state=STATE_CHARGE_COMPLETE;chg_complete_waiting=0;}}else chg_complete_waiting=0;break;
     case STATE_DISCHARGING:CHG_LED=0;DISCHG_LED=1;if((TimeStamp_GetTick()-discharge_start_tick)<50000)break;if(curBatVolt<=overdischargeProtectVolt&&curDischargeCurrentMA>300){if(!dischg_overd_waiting){dischg_overd_waiting=1;dischg_overd_wait_start_tick=TimeStamp_GetTick();}else if((TimeStamp_GetTick()-dischg_overd_wait_start_tick)>=UNDER_VOLT_CONFIRM_MS){DISCHARGE_CTRL=0;FAN_CTRL=0;current_state=STATE_IDLE;dischg_overd_waiting=0;}}else dischg_overd_waiting=0;if(curDischargeCurrentMA<=300){if(!dischg_complete_waiting){dischg_complete_waiting=1;dischg_complete_wait_start_tick=TimeStamp_GetTick();}else if((TimeStamp_GetTick()-dischg_complete_wait_start_tick)>=DISCHG_COMPLETE_CONFIRM_MS){DISCHARGE_CTRL=0;FAN_CTRL=0;current_state=STATE_DISCHARGE_COMPLETE;dischg_complete_waiting=0;}}else dischg_complete_waiting=0;break;
-    case STATE_CHARGE_COMPLETE:current_state=STATE_IDLE;break;
-    case STATE_DISCHARGE_COMPLETE:current_state=STATE_IDLE;break;}
+    case STATE_CHARGE_COMPLETE:CHG_LED=0;DISCHG_LED=0;break;
+    case STATE_DISCHARGE_COMPLETE:CHG_LED=0;DISCHG_LED=0;break;}
 }
 
 

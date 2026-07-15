@@ -65,6 +65,9 @@ STAGE_CHARGE1 = 1
 STAGE_DISCHARGE = 2
 STAGE_CHARGE2 = 3
 STAGE_COMPLETED = 4
+DATA_STALE_RETRY_SEC = 10
+DATA_STALE_ABORT_SEC = 60
+NO_PROGRESS_ABORT_SEC = 30 * 60
 
 CURRENT_THRESHOLD = 50  # mA
 
@@ -301,6 +304,8 @@ class ModuleTestState:
         self.result = None
         self.completed = False
         self.stage_start_time = time.time()
+        self.last_progress_time = self.stage_start_time
+        self.last_retry_time = 0
         self._last_chg = 0
         self._last_dchg = 0
         self._chg_stable = 0
@@ -319,6 +324,8 @@ class ModuleTestState:
         self.result = None
         self.completed = False
         self.stage_start_time = time.time()
+        self.last_progress_time = self.stage_start_time
+        self.last_retry_time = 0
         self._last_chg = 0
         self._last_dchg = 0
         self._chg_stable = 0
@@ -337,6 +344,8 @@ class LoopModuleState:
         self.charge_max = 0
         self.discharge_max = 0
         self.stage_start_time = time.time()
+        self.last_progress_time = self.stage_start_time
+        self.last_retry_time = 0
         self._last_chg = 0
         self._last_dchg = 0
         self._chg_stable = 0
@@ -353,6 +362,8 @@ class LoopModuleState:
         self.completed = False
         self.charge_end = 0
         self.stage_start_time = time.time()
+        self.last_progress_time = self.stage_start_time
+        self.last_retry_time = 0
         self._last_chg = 0
         self._last_dchg = 0
         self._chg_stable = 0
@@ -719,6 +730,8 @@ class MainWindow(QMainWindow):
         self.last_status = [0] * MODULE_COUNT
         self.last_charge_mah = [0] * MODULE_COUNT
         self.last_discharge_mah = [0] * MODULE_COUNT
+        self.module_last_seen = [0] * MODULE_COUNT
+        self.module_miss_count = [0] * MODULE_COUNT
 
         self.charge_max = [0] * MODULE_COUNT
         self.discharge_max = [0] * MODULE_COUNT
@@ -1390,6 +1403,16 @@ class MainWindow(QMainWindow):
             self._write_save_line(module_idx, 'discharge', value, voltage)
 
 
+    def _touch_state_progress(self, state):
+        state.last_progress_time = time.time()
+
+    def _reset_state_timer(self, state, now=None):
+        if now is None:
+            now = time.time()
+        state.stage_start_time = now
+        state.last_progress_time = now
+        state.last_retry_time = 0
+
     def send_command_reliable(self, cmd, addr, data=None):
         """Non-blocking send: fire-and-forget + optional retry via timer."""
         if self.serial_thread is None or self.serial_thread.ser is None or not self.serial_thread.ser.is_open:
@@ -1803,6 +1826,14 @@ class MainWindow(QMainWindow):
 
     # ---------- 数据处理 ----------
     def on_data_received(self, modules):
+        now = time.time()
+        for i, mod in enumerate(modules):
+            if mod is None:
+                self.module_miss_count[i] += 1
+            else:
+                self.module_last_seen[i] = now
+                self.module_miss_count[i] = 0
+
         for mod in modules:
             if mod is None:
                 continue
@@ -1837,7 +1868,7 @@ class MainWindow(QMainWindow):
             self._sync_display(i)
 
         current_online = set()
-        for i, mod in enumerate(self.modules_data):
+        for i, mod in enumerate(modules):
             if mod is None:
                 continue
             if (mod['voltage'] > 0 or mod['charge_current'] > 0 or
@@ -1864,16 +1895,20 @@ class MainWindow(QMainWindow):
             for idx in list(self.module_test_states.keys()):
                 state = self.module_test_states.get(idx)
                 if isinstance(state, LoopModuleState) and not state.completed:
-                    mod = self.modules_data[idx]
+                    mod = modules[idx] if 0 <= idx < len(modules) else None
                     if mod:
                         self.update_loop_state(idx, state, mod)
+                    else:
+                        self._handle_stale_state(idx, state)
         else:
             for idx in list(self.module_test_states.keys()):
                 state = self.module_test_states.get(idx)
                 if isinstance(state, ModuleTestState) and not state.completed:
-                    mod = self.modules_data[idx]
+                    mod = modules[idx] if 0 <= idx < len(modules) else None
                     if mod:
                         self.update_module_test_state(idx, state, mod)
+                    else:
+                        self._handle_stale_state(idx, state)
 
         self.update_table()
 
@@ -1963,7 +1998,7 @@ class MainWindow(QMainWindow):
                 state.charge_end = mod['charge_mah']
                 self.send_command_reliable(CMD_START_DISCHARGE, addr)
                 state.discharge_start = 0
-                state.stage_start_time = now
+                self._reset_state_timer(state, now)
                 self.on_log_message("CYCLE %d/%d: %#04x charge %dmAh -> discharge" % (state.current_cycle+1, state.total_cycles, addr, chg_val), "info")
                 # Verify discharge actually started in 1.5s
                 QTimer.singleShot(1500, lambda a=addr, i=idx: self._verify_discharge_started(a, i))
@@ -1978,7 +2013,7 @@ class MainWindow(QMainWindow):
                 self.send_command_reliable(CMD_START_DISCHARGE, addr)
                 state.discharge_start = 0
                 state._dchg_stable = 0
-                state.stage_start_time = now
+                self._reset_state_timer(state, now)
                 self.on_log_message("PLATEAU FALLBACK[%#04x] charge %dmAh stable=%d -> discharge" % (addr, chg_val, state._chg_stable), "error")
                 QTimer.singleShot(1500, lambda a=addr, i=idx: self._verify_discharge_started(a, i))
         elif state.stage == STAGE_DISCHARGE:
@@ -1998,7 +2033,7 @@ class MainWindow(QMainWindow):
                     self.send_command_reliable(CMD_START_CHARGE, addr)
                     state.charge_start = 0
                     state.charge_max = 0
-                    state.stage_start_time = now
+                    self._reset_state_timer(state, now)
                     self.on_log_message("CYCLE %d/%d: %#04x discharge %dmAh -> charge" % (state.current_cycle, state.total_cycles, addr, disc), "info")
             elif state._dchg_stable >= PLATEAU_THRESH and mod['discharge_mah'] > 200 and now - state.stage_start_time > 30:
                 # FALLBACK: discharge_mah plateaued, discharge likely complete but status bit missed
@@ -2017,15 +2052,17 @@ class MainWindow(QMainWindow):
                     self.send_command_reliable(CMD_START_CHARGE, addr)
                     state.charge_start = 0
                     state.charge_max = 0
-                    state.stage_start_time = now
+                    self._reset_state_timer(state, now)
                     self.on_log_message("PLATEAU FALLBACK[%#04x] discharge %dmAh stable=%d -> charge" % (addr, disc, state._dchg_stable), "error")
 
         if state.stage == STAGE_CHARGE1 and (status & 0x01):
             if mod['charge_mah'] > state.charge_max:
                 state.charge_max = mod['charge_mah']
+                self._touch_state_progress(state)
         elif state.stage == STAGE_DISCHARGE and (status & 0x02):
             if mod['discharge_mah'] > state.discharge_max:
                 state.discharge_max = mod['discharge_mah']
+                self._touch_state_progress(state)
 
     def _verify_discharge_started(self, addr, idx, attempt=1):
         """Check if discharge actually started after CMD_START_DISCHARGE. Retry if not."""
@@ -2034,8 +2071,14 @@ class MainWindow(QMainWindow):
         state = self.module_test_states.get(idx)
         if state is None or state.completed:
             return
+        now = time.time()
+        last_seen = self.module_last_seen[idx] or 0
+        if last_seen and now - last_seen >= DATA_STALE_RETRY_SEC:
+            self._handle_stale_state(idx, state)
+            return
         mod = self.modules_data[idx]
         if mod is None:
+            self._handle_stale_state(idx, state)
             return
         status = mod['status']
         if status & 0x02:  # Discharging active
@@ -2047,9 +2090,10 @@ class MainWindow(QMainWindow):
         if attempt <= 2:
             confirmed = self.serial_thread and self.serial_thread.send_command_sync(CMD_START_DISCHARGE, addr, None, 200)
             if confirmed == 0:
-                self.on_log_message("VERIFY[%#04x] ACK confirmed, discharge started" % addr, "info")
+                self.on_log_message("VERIFY[%#04x] START_DISCHARGE ACK confirmed, waiting status" % addr, "info")
                 state.discharge_start = 0
-                state.stage_start_time = time.time()
+                state.last_retry_time = now
+                QTimer.singleShot(1000, lambda: self._verify_discharge_started(addr, idx, attempt+1))
             else:
                 self.on_log_message("VERIFY FAIL[%#04x] ACK timeout, will retry" % addr, "error")
                 QTimer.singleShot(1000, lambda: self._verify_discharge_started(addr, idx, attempt+1))
@@ -2119,7 +2163,7 @@ class MainWindow(QMainWindow):
                 self.send_command_reliable(CMD_START_DISCHARGE, addr)
                 state.discharge_start = 0  # STC8H resets on start
                 state.discharge_max = 0  # STC8H resets on start
-                state.stage_start_time = time.time()
+                self._reset_state_timer(state, now)
                 self.on_log_message(tr('discharge_started', addr), "info")
                 QTimer.singleShot(1500, lambda a=addr, i=idx: self._verify_discharge_started(a, i))
                 return
@@ -2135,7 +2179,7 @@ class MainWindow(QMainWindow):
                 state.discharge_start = 0
                 state.discharge_max = 0
                 state._dchg_stable = 0
-                state.stage_start_time = time.time()
+                self._reset_state_timer(state, now)
                 self.on_log_message(tr('discharge_started', addr), "info")
                 QTimer.singleShot(1500, lambda a=addr, i=idx: self._verify_discharge_started(a, i))
                 return
@@ -2149,7 +2193,7 @@ class MainWindow(QMainWindow):
                 self.add_cycle_record(idx, 'discharge', discharged, mod['voltage'])
 
                 state.stage = STAGE_CHARGE2
-                state.stage_start_time = time.time()
+                self._reset_state_timer(state, now)
                 self.send_command_reliable(CMD_START_CHARGE, addr)
                 state.charge2_start = 0  # STC8H resets on start
                 state.charge2_max = 0  # STC8H resets on start
@@ -2163,7 +2207,7 @@ class MainWindow(QMainWindow):
                 state.discharge_cap = discharged
                 self.add_cycle_record(idx, 'discharge', discharged, mod['voltage'])
                 state.stage = STAGE_CHARGE2
-                state.stage_start_time = time.time()
+                self._reset_state_timer(state, now)
                 self.send_command_reliable(CMD_START_CHARGE, addr)
                 state.charge2_start = 0
                 state.charge2_max = 0
@@ -2221,12 +2265,15 @@ class MainWindow(QMainWindow):
         if state.stage == STAGE_CHARGE1 and (status & 0x01):
             if mod['charge_mah'] > state.charge1_max:
                 state.charge1_max = mod['charge_mah']
+                self._touch_state_progress(state)
         elif state.stage == STAGE_DISCHARGE and (status & 0x02):
             if mod['discharge_mah'] > state.discharge_max:
                 state.discharge_max = mod['discharge_mah']
+                self._touch_state_progress(state)
         elif state.stage == STAGE_CHARGE2 and (status & 0x01):
             if mod['charge_mah'] > state.charge2_max:
                 state.charge2_max = mod['charge_mah']
+                self._touch_state_progress(state)
 
     def on_test_timeout(self):
         if not self.test_running:
@@ -2600,6 +2647,62 @@ class MainWindow(QMainWindow):
         self._display = [None] * MODULE_COUNT
         self._nobat_debounce = [0] * MODULE_COUNT
 
+    def _abort_state_as_failed(self, idx, state, reason):
+        addr = MODULE_ADDRS[idx]
+        self.send_command_reliable(CMD_STOP_CHARGE, addr)
+        self.send_command_reliable(CMD_STOP_DISCHARGE, addr)
+        if isinstance(state, ModuleTestState):
+            self.abort_module_test(idx, state, 'NG')
+        else:
+            state.completed = True
+            self.on_log_message("ABORT[%#04x] %s" % (addr, reason), "error")
+            self.check_loop_all_completed()
+
+    def _stage_start_command(self, stage):
+        if stage == STAGE_CHARGE1 or stage == STAGE_CHARGE2:
+            return CMD_START_CHARGE
+        if stage == STAGE_DISCHARGE:
+            return CMD_START_DISCHARGE
+        return None
+
+    def _handle_stale_state(self, idx, state):
+        if not self.test_running or state.completed:
+            return
+        now = time.time()
+        addr = MODULE_ADDRS[idx]
+        if not hasattr(state, 'last_progress_time'):
+            state.last_progress_time = state.stage_start_time
+        if not hasattr(state, 'last_retry_time'):
+            state.last_retry_time = 0
+
+        last_seen = self.module_last_seen[idx] or state.stage_start_time
+        stale_sec = now - last_seen
+        no_progress_sec = now - state.last_progress_time
+
+        if no_progress_sec >= NO_PROGRESS_ABORT_SEC:
+            self._abort_state_as_failed(idx, state, "no capacity progress for %.0fs" % no_progress_sec)
+            return
+
+        if stale_sec < DATA_STALE_RETRY_SEC:
+            return
+
+        if stale_sec >= DATA_STALE_ABORT_SEC:
+            self._abort_state_as_failed(idx, state, "no fresh data for %.0fs" % stale_sec)
+            return
+
+        if now - state.last_retry_time < DATA_STALE_RETRY_SEC:
+            return
+
+        cmd = self._stage_start_command(state.stage)
+        if cmd is None:
+            return
+        state.last_retry_time = now
+        self.on_log_message(
+            "STALE[%#04x] no fresh data %.0fs, re-send %s" %
+            (addr, stale_sec, CMD_NAMES.get(cmd, "CMD 0x%02X" % cmd)),
+            "error")
+        self.send_command_reliable(cmd, addr)
+
     def _state_watchdog(self):
         """Periodic state watchdog: if module status doesn't match expected stage, re-send command."""
         if not self.test_running:
@@ -2609,11 +2712,16 @@ class MainWindow(QMainWindow):
             if state.completed:
                 continue
             mod = self.modules_data[idx]
-            if mod is None:
+            last_seen = self.module_last_seen[idx] or 0
+            if mod is None or (last_seen and now - last_seen >= DATA_STALE_RETRY_SEC):
+                self._handle_stale_state(idx, state)
                 continue
             addr = MODULE_ADDRS[idx]
             status = mod['status']
             elapsed = now - state.stage_start_time
+            if now - getattr(state, 'last_progress_time', state.stage_start_time) >= NO_PROGRESS_ABORT_SEC:
+                self._abort_state_as_failed(idx, state, "no capacity progress")
+                continue
 
             if (state.stage == STAGE_CHARGE1 or state.stage == STAGE_CHARGE2):
                 # Should be charging (0x01) or charge-complete (0x10) or no-battery (0x40)
@@ -2621,8 +2729,12 @@ class MainWindow(QMainWindow):
                     if elapsed > 8.0:
                         self.on_log_message("WATCHDOG[%#04x] stage=%s not charging %.0fs, re-send START_CHARGE" % (addr, state.stage, elapsed), "error")
                         if self.serial_thread:
-                            self.serial_thread.send_command_sync(CMD_START_CHARGE, addr, None, 200)
-                        state.stage_start_time = now
+                            status = self.serial_thread.send_command_sync(CMD_START_CHARGE, addr, None, 200)
+                            if status == 0:
+                                state.stage_start_time = now
+                                state.last_retry_time = now
+                            else:
+                                self.on_log_message("WATCHDOG[%#04x] START_CHARGE ACK failed: %s" % (addr, status), "error")
 
             elif state.stage == STAGE_DISCHARGE:
                 # Should be discharging (0x02) or discharge-complete (0x20) or no-battery (0x40)
@@ -2630,8 +2742,12 @@ class MainWindow(QMainWindow):
                     if elapsed > 8.0:
                         self.on_log_message("WATCHDOG[%#04x] stage=DISCHARGE not discharging %.0fs, re-send START_DISCHARGE" % (addr, elapsed), "error")
                         if self.serial_thread:
-                            self.serial_thread.send_command_sync(CMD_START_DISCHARGE, addr, None, 200)
-                        state.stage_start_time = now
+                            status = self.serial_thread.send_command_sync(CMD_START_DISCHARGE, addr, None, 200)
+                            if status == 0:
+                                state.stage_start_time = now
+                                state.last_retry_time = now
+                            else:
+                                self.on_log_message("WATCHDOG[%#04x] START_DISCHARGE ACK failed: %s" % (addr, status), "error")
 
     def update_table(self):
         self.update_module_detail()
