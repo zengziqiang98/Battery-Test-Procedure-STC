@@ -129,6 +129,8 @@ class LanguageManager:
             'no_data': {'zh': '无数据', 'en': 'No Data'},
             'no_battery': {'zh': '无电池', 'en': 'No Battery'},
             'no_battery_short': {'zh': '无电池', 'en': 'NoBat'},
+            'executor_offline': {'zh': '中转在线/执行离线', 'en': 'Bridge OK / Executor Offline'},
+            'executor_offline_short': {'zh': '执行离线', 'en': 'Exec Offline'},
             'collapse_panel': {'zh': '收起控制面板', 'en': 'Collapse Panel'},
             'expand_panel': {'zh': '展开控制面板', 'en': 'Expand Panel'},
             'test_status_idle': {'zh': '状态: 空闲', 'en': 'Status: Idle'},
@@ -1305,6 +1307,14 @@ class MainWindow(QMainWindow):
             self.lbl_detail_dchg.setText("")
             self.lbl_detail_qc.setText("")
             return
+        if not mod.get("executor_online", True):
+            self.lbl_detail_addr.setText("Module %d (0x%02X)" % (idx+1, addr))
+            self.lbl_detail_status.setText(self.tr("executor_offline", "Bridge OK / Executor Offline"))
+            self.lbl_detail_cycle.setText("")
+            self.lbl_detail_chg.setText("")
+            self.lbl_detail_dchg.setText("")
+            self.lbl_detail_qc.setText("")
+            return
         parts = []
         if mod["status"] & 0x01: parts.append("Chg")
         if mod["status"] & 0x02: parts.append("Dchg")
@@ -1432,6 +1442,9 @@ class MainWindow(QMainWindow):
     def _is_module_fresh(self, idx, max_age=TEST_START_FRESH_SEC):
         last_seen = self.module_last_seen[idx] if 0 <= idx < MODULE_COUNT else 0
         if not last_seen:
+            return False
+        mod = self.modules_data[idx] if 0 <= idx < MODULE_COUNT else None
+        if not mod or not mod.get('executor_online', True):
             return False
         return (time.time() - last_seen) <= max_age
 
@@ -1932,7 +1945,10 @@ class MainWindow(QMainWindow):
                     mod = modules[idx] if 0 <= idx < len(modules) else None
                     try:
                         if mod:
-                            self.update_loop_state(idx, state, mod)
+                            if not mod.get('executor_online', True):
+                                self._abort_state_as_failed(idx, state, "executor offline")
+                            else:
+                                self.update_loop_state(idx, state, mod)
                         else:
                             self._handle_stale_state(idx, state)
                     except Exception as e:
@@ -1945,7 +1961,10 @@ class MainWindow(QMainWindow):
                     mod = modules[idx] if 0 <= idx < len(modules) else None
                     try:
                         if mod:
-                            self.update_module_test_state(idx, state, mod)
+                            if not mod.get('executor_online', True):
+                                self._abort_state_as_failed(idx, state, "executor offline")
+                            else:
+                                self.update_module_test_state(idx, state, mod)
                         else:
                             self._handle_stale_state(idx, state)
                     except Exception as e:
@@ -2678,6 +2697,8 @@ class MainWindow(QMainWindow):
             'status': raw['status'],
             'cycle': raw['cycle'],
             'ck_fail_count': raw.get('ck_fail_count', 0),
+            'bridge_online': raw.get('bridge_online', True),
+            'executor_online': raw.get('executor_online', True),
             'has_reading': raw['voltage'] > 0 or raw['charge_current'] > 0 or
                           raw['discharge_current'] > 0 or raw['status'] != 0
         }
@@ -2688,6 +2709,10 @@ class MainWindow(QMainWindow):
         if raw is None:
             self._nobat_debounce[idx] = 0
             self._display[idx] = None
+            return
+        if raw.get("bridge_online") and not raw.get("executor_online", True):
+            self._nobat_debounce[idx] = 0
+            self._display[idx] = self._make_display_record(raw)
             return
         is_nobat = (raw["status"] & 0x40) or (raw["voltage"] == 0 and raw["charge_current"] == 0 and raw["discharge_current"] == 0)
         disp = self._display[idx]
@@ -2720,6 +2745,8 @@ class MainWindow(QMainWindow):
             "status": raw["status"],
             "cycle": raw["cycle"],
             "ck_fail_count": raw.get("ck_fail_count", 0),
+            "bridge_online": raw.get("bridge_online", True),
+            "executor_online": raw.get("executor_online", True),
             "has_reading": disp["has_reading"] or (raw["voltage"] > 0 or raw["status"] != 0),
         }
     def _reset_display(self):
@@ -2810,6 +2837,9 @@ class MainWindow(QMainWindow):
             if mod is None or now - last_seen >= DATA_STALE_RETRY_SEC:
                 self._handle_stale_state(idx, state)
                 continue
+            if not mod.get('executor_online', True):
+                self._abort_state_as_failed(idx, state, "executor offline")
+                continue
             addr = MODULE_ADDRS[idx]
             status = mod['status']
             elapsed = now - state.stage_start_time
@@ -2851,8 +2881,11 @@ class MainWindow(QMainWindow):
                 for c in range(1, self.main_table.columnCount()):
                     self.main_table.setItem(i, c, QTableWidgetItem(""))
                 continue
+            executor_offline = mod.get('bridge_online') and not mod.get('executor_online', True)
             status_str = ""
-            if mod['status'] & 0x01:
+            if executor_offline:
+                status_str = tr('executor_offline_short', default="Exec Offline")
+            elif mod['status'] & 0x01:
                 status_str += tr('charge_started_short', default="Charging ")
             if mod['status'] & 0x02:
                 status_str += tr('discharge_started_short', default="Discharging ")
@@ -2872,7 +2905,9 @@ class MainWindow(QMainWindow):
             set_cycle = self.set_cycle_nums[i]
             current_cycle = mod['cycle']
             test_status = ""
-            if mod['status'] & 0x40:
+            if executor_offline:
+                test_status = tr('executor_offline', default="Bridge OK / Executor Offline")
+            elif mod['status'] & 0x40:
                 test_status = tr('no_battery', default="No Battery")
             elif set_cycle > 0:
                 if current_cycle >= set_cycle:
@@ -2903,6 +2938,9 @@ class MainWindow(QMainWindow):
             qc_result = ""
             test_caps = ""
             row_color = QColor(255, 255, 255)
+            if executor_offline:
+                row_color = QColor(255, 245, 180)
+                alarm_type = tr('executor_offline_short', default="Exec Offline")
 
             if self.global_test_results[i]:
                 result = self.global_test_results[i]

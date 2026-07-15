@@ -15,6 +15,7 @@ MODULE_COUNT = 64
 POLL_READ_TIMEOUT_SEC = 0.004  # cached bridge batch read is ~2.3ms; keep headroom
 PROBE_TIMEOUT_SEC = 0.0020     # 1.8ms can miss during full scans; 2ms is stable
 MIN_ROUND_PERIOD_SEC = 0.0     # no forced 1s sleep; fastest polling
+EXECUTOR_OFFLINE = object()
 
 def xor_checksum(data):
     c = 0
@@ -60,19 +61,36 @@ class ProtocolThread(QThread):
                     addrs = list(self._active)
 
                 t_scan_start = time.time()
-                online_this = []; offline_this = []
+                online_this = []; bridge_only_this = []; offline_this = []
 
                 for a in addrs:
-                    if scan_all and not self._probe_addr(a):
+                    bridge_seen = False
+                    if scan_all:
+                        bridge_seen = self._probe_addr(a)
+                    else:
+                        bridge_seen = True
+                    if not bridge_seen:
                         self._offline[a] = self._offline.get(a, 0) + 1
                         if self._offline[a] >= 30: self._active.discard(a)
                         offline_this.append(str(a))
                         continue
                     regs = self._read_raw(a)
+                    if regs is None and not scan_all:
+                        bridge_seen = self._probe_addr(a)
+                    if regs is None and bridge_seen:
+                        self._offline[a] = 0; self._active.add(a)
+                        bridge_only_this.append(str(a))
+                        data[a - 1] = self._bridge_only_record(a)
+                        continue
                     if regs is None:
                         self._offline[a] = self._offline.get(a, 0) + 1
                         if self._offline[a] >= 30: self._active.discard(a)
                         offline_this.append(str(a))
+                        continue
+                    if regs is EXECUTOR_OFFLINE:
+                        self._offline[a] = 0; self._active.add(a)
+                        bridge_only_this.append(str(a))
+                        data[a - 1] = self._bridge_only_record(a)
                         continue
                     self._offline[a] = 0; self._active.add(a)
                     online_this.append(str(a))
@@ -87,7 +105,8 @@ class ProtocolThread(QThread):
                     data[a - 1] = {'addr': a, 'voltage': regs[4],
                         'charge_current': regs[5], 'discharge_current': regs[6],
                         'charge_mah': regs[2], 'discharge_mah': regs[3],
-                        'status': st, 'cycle': regs[9], 'ck_fail_count': 0}
+                        'status': st, 'cycle': regs[9], 'ck_fail_count': 0,
+                        'bridge_online': True, 'executor_online': True}
 
                 self.data_received.emit(data)
                 t_scan = (time.time() - t_scan_start)
@@ -97,7 +116,7 @@ class ProtocolThread(QThread):
 
                 self.log_message.emit(
                     f"轮{self._round} {t_scan*1000:.0f}ms "
-                    f"在线{len(online_this)} 离线{len(offline_this)}",
+                    f"执行在线{len(online_this)} 中转在线执行离线{len(bridge_only_this)} 离线{len(offline_this)}",
                     "comm")
 
                 if self._round == 1:
@@ -170,11 +189,19 @@ class ProtocolThread(QThread):
 
             if len(resp) < 27: return None
             if resp[0] != addr or resp[1] != (CMD_BATCH_READ | 0x80): return None
-            if resp[2] != RESP_OK or resp[3] != 22: return None
             if xor_checksum(resp[:-1]) != resp[-1]: return None
+            if resp[3] == 22 and resp[2] != RESP_OK: return EXECUTOR_OFFLINE
+            if resp[2] != RESP_OK or resp[3] != 22: return None
             return struct.unpack('>11H', resp[4:26])
         except Exception:
             return None
+
+    def _bridge_only_record(self, addr):
+        return {'addr': addr, 'voltage': 0,
+            'charge_current': 0, 'discharge_current': 0,
+            'charge_mah': 0, 'discharge_mah': 0,
+            'status': 0, 'cycle': 0, 'ck_fail_count': 0,
+            'bridge_online': True, 'executor_online': False}
     # ===== 命令接口 (入队, 不阻塞轮询) =====
 
     def send_command(self, cmd_code, addr, data=None):
