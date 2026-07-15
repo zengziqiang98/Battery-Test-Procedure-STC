@@ -17,7 +17,7 @@
 #include "i2c_cmd.h"
 #include <string.h>
 
-#define EXEC_I2C_ADDR_8   (I2C_SLAVE_ADDR << 1)
+#define EXECUTOR_I2C_ADDR_8_FIXED (I2C_SLAVE_ADDR << 1)
 #define I2C_SPEED_100K    60
 #define MAX_REG_COUNT     60
 #define CACHE_FIRST_REG   REG_STATUS_CHARGE
@@ -53,6 +53,20 @@ static void send_buf(unsigned char *buf, unsigned char len)
     for (i = 0; i < len; i++) TX1_write2buff(buf[i]);
 }
 
+static unsigned char read_bridge_hw_addr(void)
+{
+    unsigned char hw = 0;
+
+    /* bit5..bit0 = P0.1, P0.0, P2.7, P2.6, P2.5, P2.4 */
+    hw |= (P01) ? 0x20 : 0x00;
+    hw |= (P00) ? 0x10 : 0x00;
+    hw |= (P27) ? 0x08 : 0x00;
+    hw |= (P26) ? 0x04 : 0x00;
+    hw |= (P25) ? 0x02 : 0x00;
+    hw |= (P24) ? 0x01 : 0x00;
+    return (unsigned char)(hw + 1);
+}
+
 static unsigned char iic_read_checked(unsigned char cmd, unsigned char *out, unsigned char len)
 {
     unsigned char tmp[4];
@@ -60,7 +74,7 @@ static unsigned char iic_read_checked(unsigned char cmd, unsigned char *out, uns
 
     if (len > 3) return 0;
     memset(tmp, 0, sizeof(tmp));
-    I2C_ReadNbyte(EXEC_I2C_ADDR_8, cmd, tmp, len + 1);
+    I2C_ReadNbyte(EXECUTOR_I2C_ADDR_8_FIXED, cmd, tmp, len + 1);
 
     for (i = 0; i < len; i++) ck ^= tmp[i];
     if (ck != tmp[len]) return 0;
@@ -71,7 +85,7 @@ static unsigned char iic_read_checked(unsigned char cmd, unsigned char *out, uns
 static void iic_write0(unsigned char cmd)
 {
     Start();
-    SendData(EXEC_I2C_ADDR_8);
+    SendData(EXECUTOR_I2C_ADDR_8_FIXED);
     RecvACK();
     SendData(cmd);
     RecvACK();
@@ -80,7 +94,7 @@ static void iic_write0(unsigned char cmd)
 
 static void iic_write1(unsigned char cmd, unsigned char val)
 {
-    I2C_WriteNbyte(EXEC_I2C_ADDR_8, cmd, &val, 1);
+    I2C_WriteNbyte(EXECUTOR_I2C_ADDR_8_FIXED, cmd, &val, 1);
 }
 
 static void iic_write2(unsigned char cmd, unsigned short val)
@@ -88,7 +102,7 @@ static void iic_write2(unsigned char cmd, unsigned short val)
     unsigned char b[2];
     b[0] = (unsigned char)(val >> 8);
     b[1] = (unsigned char)(val & 0xFF);
-    I2C_WriteNbyte(EXEC_I2C_ADDR_8, cmd, b, 2);
+    I2C_WriteNbyte(EXECUTOR_I2C_ADDR_8_FIXED, cmd, b, 2);
 }
 
 static unsigned char iic_read_u8(unsigned char cmd, unsigned short *val)
@@ -333,13 +347,7 @@ void Protocol_Init(unsigned char addr)
     I2C_InitTypeDef i2c;
 
     if (addr == 0) {
-        unsigned char hw = 0;
-        hw |= (ADDR_0) ? 0x01 : 0x00;
-        hw |= (ADDR_1) ? 0x02 : 0x00;
-        hw |= (ADDR_2) ? 0x04 : 0x00;
-        hw |= (ADDR_3) ? 0x08 : 0x00;
-        hw |= (ADDR_4) ? 0x10 : 0x00;
-        proto_addr = hw + 1;
+        proto_addr = read_bridge_hw_addr();
     } else {
         proto_addr = addr;
     }

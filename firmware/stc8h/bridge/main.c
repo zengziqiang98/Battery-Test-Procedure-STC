@@ -16,6 +16,30 @@
 #include "STC8G_H_Delay.h"
 #include "protocol.h"
 
+static void Bridge_GPIO_config(void)
+{
+    GPIO_InitTypeDef g;
+
+    /* Bridge address inputs:
+       bit5..bit0 = P0.1, P0.0, P2.7, P2.6, P2.5, P2.4.
+       The user note listed P2.6 twice; the lower duplicate is treated as P2.5. */
+    g.Mode = GPIO_HighZ;
+    g.Pin = GPIO_Pin_0 | GPIO_Pin_1;
+    GPIO_Inilize(GPIO_P0, &g);
+    g.Pin = GPIO_Pin_4 | GPIO_Pin_5 | GPIO_Pin_6 | GPIO_Pin_7;
+    GPIO_Inilize(GPIO_P2, &g);
+
+    /* UART1 P3.0/P3.1 */
+    g.Mode = GPIO_PullUp;
+    g.Pin = GPIO_Pin_0 | GPIO_Pin_1;
+    GPIO_Inilize(GPIO_P3, &g);
+
+    /* IIC master P1.4/P1.5 */
+    g.Mode = GPIO_OUT_OD;
+    g.Pin = GPIO_Pin_4 | GPIO_Pin_5;
+    GPIO_Inilize(GPIO_P1, &g);
+}
+
 void UART_config(void)
 {
     COMx_InitDefine s;
@@ -49,7 +73,7 @@ void main(void)
     EAXSFR();
     XOSC_Init();
 
-    GPIO_config();
+    Bridge_GPIO_config();
     UART_config();
     Protocol_Init(0);
     EA=1;
