@@ -14,6 +14,7 @@
 #include "STC8G_H_UART.h"
 #include "STC8G_H_I2C.h"
 #include "STC8G_H_Switch.h"
+#include "STC8G_H_Delay.h"
 #include "i2c_cmd.h"
 #include <string.h>
 
@@ -28,8 +29,9 @@
 #define CACHE_FAIL_LIMIT  3
 #define CACHE_FAIL_COOLDOWN_TICKS 50
 #define CACHE_SUCCESS_COOLDOWN_TICKS 5
-#define CACHE_AFTER_SERIAL_COOLDOWN_TICKS 20
+#define CACHE_AFTER_SERIAL_COOLDOWN_TICKS 0
 #define SERIAL_LED_PULSE_TICKS 3
+#define SERIAL_RS485_TURNAROUND_MS 1
 
 static unsigned char proto_addr;
 static unsigned char tx_buf[128];
@@ -48,6 +50,12 @@ static unsigned char xor_bytes(unsigned char *buf, unsigned char len)
     unsigned char i, ck = 0;
     for (i = 0; i < len; i++) ck ^= buf[i];
     return ck;
+}
+
+static unsigned char iic_ack_ok(void)
+{
+    RecvACK();
+    return (I2CMSST & 0x01) == 0;
 }
 
 static void mark_rx_activity(void)
@@ -79,6 +87,7 @@ static void send_buf(unsigned char *buf, unsigned char len)
 {
     unsigned char i;
     if (len > 0) mark_tx_activity();
+    if (SERIAL_RS485_TURNAROUND_MS > 0) delay_ms(SERIAL_RS485_TURNAROUND_MS);
     for (i = 0; i < len; i++) serial_send_byte(buf[i]);
 }
 
@@ -103,7 +112,21 @@ static unsigned char iic_read_checked(unsigned char cmd, unsigned char *out, uns
 
     if (len > 3) return 0;
     memset(tmp, 0, sizeof(tmp));
-    I2C_ReadNbyte(EXECUTOR_I2C_ADDR_8_FIXED, cmd, tmp, len + 1);
+
+    Start();
+    SendData(EXECUTOR_I2C_ADDR_8_FIXED);
+    if (!iic_ack_ok()) { Stop(); return 0; }
+    SendData(cmd);
+    if (!iic_ack_ok()) { Stop(); return 0; }
+    Start();
+    SendData(EXECUTOR_I2C_ADDR_8_FIXED | 1);
+    if (!iic_ack_ok()) { Stop(); return 0; }
+    for (i = 0; i < (unsigned char)(len + 1); i++) {
+        tmp[i] = RecvData();
+        if (i + 1 < (unsigned char)(len + 1)) SendACK();
+    }
+    SendNAK();
+    Stop();
 
     for (i = 0; i < len; i++) ck ^= tmp[i];
     if (ck != tmp[len]) return 0;
@@ -111,27 +134,46 @@ static unsigned char iic_read_checked(unsigned char cmd, unsigned char *out, uns
     return 1;
 }
 
-static void iic_write0(unsigned char cmd)
+static unsigned char iic_write0(unsigned char cmd)
 {
     Start();
     SendData(EXECUTOR_I2C_ADDR_8_FIXED);
-    RecvACK();
+    if (!iic_ack_ok()) { Stop(); return 0; }
     SendData(cmd);
-    RecvACK();
+    if (!iic_ack_ok()) { Stop(); return 0; }
     Stop();
+    return 1;
 }
 
-static void iic_write1(unsigned char cmd, unsigned char val)
+static unsigned char iic_write1(unsigned char cmd, unsigned char val)
 {
-    I2C_WriteNbyte(EXECUTOR_I2C_ADDR_8_FIXED, cmd, &val, 1);
+    Start();
+    SendData(EXECUTOR_I2C_ADDR_8_FIXED);
+    if (!iic_ack_ok()) { Stop(); return 0; }
+    SendData(cmd);
+    if (!iic_ack_ok()) { Stop(); return 0; }
+    SendData(val);
+    if (!iic_ack_ok()) { Stop(); return 0; }
+    Stop();
+    return 1;
 }
 
-static void iic_write2(unsigned char cmd, unsigned short val)
+static unsigned char iic_write2(unsigned char cmd, unsigned short val)
 {
     unsigned char b[2];
     b[0] = (unsigned char)(val >> 8);
     b[1] = (unsigned char)(val & 0xFF);
-    I2C_WriteNbyte(EXECUTOR_I2C_ADDR_8_FIXED, cmd, b, 2);
+    Start();
+    SendData(EXECUTOR_I2C_ADDR_8_FIXED);
+    if (!iic_ack_ok()) { Stop(); return 0; }
+    SendData(cmd);
+    if (!iic_ack_ok()) { Stop(); return 0; }
+    SendData(b[0]);
+    if (!iic_ack_ok()) { Stop(); return 0; }
+    SendData(b[1]);
+    if (!iic_ack_ok()) { Stop(); return 0; }
+    Stop();
+    return 1;
 }
 
 static unsigned char iic_read_u8(unsigned char cmd, unsigned short *val)
@@ -193,15 +235,6 @@ static void cache_init(void)
     cache_store(REG_DEVICE_ID, 0x0101);
 }
 
-static unsigned char cache_value_can_mark_online(unsigned short reg, unsigned short val)
-{
-    if (val == 0) return 0;
-    if (reg == REG_BAT_VOLT) return 1;
-    if (reg == REG_OVERC_PROT) return 1;
-    if (reg == REG_OVERD_PROT) return 1;
-    return 0;
-}
-
 static unsigned char read_cached_reg_live(unsigned short reg, unsigned short *val)
 {
     switch (reg) {
@@ -227,23 +260,22 @@ static unsigned char write_reg(unsigned short reg, unsigned short val)
     switch (reg) {
     case 0x0000:
         switch (val) {
-        case PCMD_START_DISCHARGE: iic_write0(CMD_START_DISCHARGE); return 1;
-        case PCMD_STOP_DISCHARGE:  iic_write0(CMD_STOP_DISCHARGE);  return 1;
-        case PCMD_START_CHARGE:    iic_write0(CMD_START_CHARGE);    return 1;
-        case PCMD_STOP_CHARGE:     iic_write0(CMD_STOP_CHARGE);     return 1;
+        case PCMD_START_DISCHARGE: return iic_write0(CMD_START_DISCHARGE);
+        case PCMD_STOP_DISCHARGE:  return iic_write0(CMD_STOP_DISCHARGE);
+        case PCMD_START_CHARGE:    return iic_write0(CMD_START_CHARGE);
+        case PCMD_STOP_CHARGE:     return iic_write0(CMD_STOP_CHARGE);
         case PCMD_EMERGENCY_STOP:
-            iic_write0(CMD_STOP_CHARGE);
-            iic_write0(CMD_STOP_DISCHARGE);
-            return 1;
+            return (unsigned char)(iic_write0(CMD_STOP_CHARGE) &
+                                   iic_write0(CMD_STOP_DISCHARGE));
         default:
             return 0;
         }
-    case REG_SET_OVERC_PROT:  iic_write2(CMD_SET_OVERC_PROT_VOLT, val); return 1;
-    case REG_SET_OVERD_PROT:  iic_write2(CMD_SET_OVERD_PROT_VOLT, val); return 1;
-    case REG_SET_CYCLE_NUM:   iic_write1(CMD_SET_CYCLE_DISCH_NUM, (unsigned char)val); return 1;
-    case REG_SET_CHG_VOLT:    iic_write1(CMD_SET_CHARGE_VOLT, (unsigned char)val); return 1;
-    case REG_SET_CHG_CURRENT: iic_write1(CMD_SET_CHARGE_CURRENT, (unsigned char)val); return 1;
-    case REG_SET_BAT_TYPE:    iic_write1(CMD_SET_BAT_TYPE, (unsigned char)val); return 1;
+    case REG_SET_OVERC_PROT:  return iic_write2(CMD_SET_OVERC_PROT_VOLT, val);
+    case REG_SET_OVERD_PROT:  return iic_write2(CMD_SET_OVERD_PROT_VOLT, val);
+    case REG_SET_CYCLE_NUM:   return iic_write1(CMD_SET_CYCLE_DISCH_NUM, (unsigned char)val);
+    case REG_SET_CHG_VOLT:    return iic_write1(CMD_SET_CHARGE_VOLT, (unsigned char)val);
+    case REG_SET_CHG_CURRENT: return iic_write1(CMD_SET_CHARGE_CURRENT, (unsigned char)val);
+    case REG_SET_BAT_TYPE:    return iic_write1(CMD_SET_BAT_TYPE, (unsigned char)val);
     default:
         return 0;
     }
@@ -441,8 +473,8 @@ void Protocol_Background(void)
     if (cache_scan_index >= CACHE_DEVICE_IDX) cache_scan_index = 0;
     reg = (unsigned short)(CACHE_FIRST_REG + cache_scan_index);
 
-    if (read_cached_reg_live(reg, &val) && (cache_online || val != 0)) {
-        if (cache_value_can_mark_online(reg, val)) cache_online = 1;
+    if (read_cached_reg_live(reg, &val)) {
+        cache_online = 1;
         cache_store(reg, val);
         cache_fail_count = 0;
         cache_cooldown = CACHE_SUCCESS_COOLDOWN_TICKS;

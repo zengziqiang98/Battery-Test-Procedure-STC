@@ -12,8 +12,9 @@ _OLD_CMD_MAP = {0x01:0x05,0x02:0x06,0x03:0x03,0x04:0x04,
 _BCAST_MAP = {0x20:0x03,0x21:0x04,0x22:0x05,0x23:0x06,
     0x24:('w',0x12,1),0x25:('w',0x15,1),0x26:0x07}
 MODULE_COUNT = 64
-POLL_READ_TIMEOUT_SEC = 0.004  # cached bridge batch read is ~2.3ms; keep headroom
-PROBE_TIMEOUT_SEC = 0.0020     # 1.8ms can miss during full scans; 2ms is stable
+POLL_READ_TIMEOUT_SEC = 0.006  # RS485 adapters can add turn-around delay
+PROBE_TIMEOUT_SEC = 0.004
+SERIAL_ATTEMPTS = 2
 MIN_ROUND_PERIOD_SEC = 0.0     # no forced 1s sleep; fastest polling
 EXECUTOR_OFFLINE = object()
 
@@ -148,51 +149,66 @@ class ProtocolThread(QThread):
             if done is not None:
                 done.set()
 
-    def _read_reply_nonblocking(self, expected_len, timeout_sec):
+    def _read_reply_nonblocking(self, expected_len, timeout_sec, extra_len=16):
         resp = bytearray()
         deadline = time.perf_counter() + timeout_sec
-        while len(resp) < expected_len and time.perf_counter() < deadline:
+        limit = expected_len + extra_len
+        while len(resp) < limit and time.perf_counter() < deadline:
             waiting = self._s.in_waiting
             if waiting:
-                resp.extend(self._s.read(min(expected_len - len(resp), waiting)))
+                resp.extend(self._s.read(min(limit - len(resp), waiting)))
             else:
                 time.sleep(0)
         return resp
+
+    def _find_reply(self, buf, addr, cmd, expected_len):
+        resp_cmd = cmd | 0x80
+        end = len(buf) - expected_len + 1
+        for i in range(max(0, end)):
+            resp = buf[i:i + expected_len]
+            if resp[0] != addr or resp[1] != resp_cmd:
+                continue
+            if xor_checksum(resp[:-1]) != resp[-1]:
+                continue
+            return resp
+        return None
 
     def _probe_addr(self, addr):
         """Fast no-IIC probe: read DEVICE_ID register only."""
         if self._s is None: return False
         try:
-            frame = bytearray([addr, 0x01, 3, 0x00, 0x0B, 0x01])
-            frame.append(xor_checksum(frame))
-            self._s.timeout = 0
-            self._s.reset_input_buffer()
-            self._s.write(frame); self._s.flush()
-            resp = self._read_reply_nonblocking(7, PROBE_TIMEOUT_SEC)
-            if len(resp) != 7 or resp[0] != addr or resp[1] != 0x81: return False
-            if resp[2] != RESP_OK or resp[3] != 2: return False
-            if xor_checksum(resp[:-1]) != resp[-1]: return False
-            return True
+            for _ in range(SERIAL_ATTEMPTS):
+                frame = bytearray([addr, 0x01, 3, 0x00, 0x0B, 0x01])
+                frame.append(xor_checksum(frame))
+                self._s.timeout = 0
+                self._s.reset_input_buffer()
+                self._s.write(frame); self._s.flush()
+                buf = self._read_reply_nonblocking(7, PROBE_TIMEOUT_SEC)
+                resp = self._find_reply(buf, addr, 0x01, 7)
+                if resp is not None and resp[2] == RESP_OK and resp[3] == 2:
+                    return True
+            return False
         except Exception:
             return False
     def _read_raw(self, addr):
         """Read one module with a 10ms non-blocking deadline."""
         if self._s is None: return None
         try:
-            frame = bytearray([addr, CMD_BATCH_READ, 3, 0x00, 0x01, 0x0B])
-            frame.append(xor_checksum(frame))
-            self._s.timeout = 0
-            self._s.reset_input_buffer()
-            self._s.write(frame); self._s.flush()
+            for _ in range(SERIAL_ATTEMPTS):
+                frame = bytearray([addr, CMD_BATCH_READ, 3, 0x00, 0x01, 0x0B])
+                frame.append(xor_checksum(frame))
+                self._s.timeout = 0
+                self._s.reset_input_buffer()
+                self._s.write(frame); self._s.flush()
 
-            resp = self._read_reply_nonblocking(27, POLL_READ_TIMEOUT_SEC)
-
-            if len(resp) < 27: return None
-            if resp[0] != addr or resp[1] != (CMD_BATCH_READ | 0x80): return None
-            if xor_checksum(resp[:-1]) != resp[-1]: return None
-            if resp[3] == 22 and resp[2] != RESP_OK: return EXECUTOR_OFFLINE
-            if resp[2] != RESP_OK or resp[3] != 22: return None
-            return struct.unpack('>11H', resp[4:26])
+                buf = self._read_reply_nonblocking(27, POLL_READ_TIMEOUT_SEC)
+                resp = self._find_reply(buf, addr, CMD_BATCH_READ, 27)
+                if resp is None:
+                    continue
+                if resp[3] == 22 and resp[2] != RESP_OK: return EXECUTOR_OFFLINE
+                if resp[2] != RESP_OK or resp[3] != 22: continue
+                return struct.unpack('>11H', resp[4:26])
+            return None
         except Exception:
             return None
 
@@ -247,14 +263,14 @@ class ProtocolThread(QThread):
 
     def _cmd_raw(self, addr, cmd):
         f = bytearray([addr, cmd, 0]); f.append(xor_checksum(f))
-        self._s.timeout = 0.03
+        self._s.timeout = 0
+        self._s.reset_input_buffer()
         self._s.write(f); self._s.flush()
         if addr == 0:
             return 0
-        resp = self._s.read(5)
-        if len(resp) != 5 or resp[0] != addr or resp[1] != (cmd | 0x80):
-            return -1
-        if xor_checksum(resp[:-1]) != resp[-1]:
+        buf = self._read_reply_nonblocking(5, 0.03)
+        resp = self._find_reply(buf, addr, cmd, 5)
+        if resp is None:
             return -1
         self.command_response.emit(cmd, resp[2], b"")
         return resp[2]
@@ -262,14 +278,14 @@ class ProtocolThread(QThread):
     def _write_raw(self, addr, reg, val):
         d = bytes([(reg>>8)&0xFF, reg&0xFF, (val>>8)&0xFF, val&0xFF])
         f = bytearray([addr, CMD_WRITE, len(d)]); f.extend(d); f.append(xor_checksum(f))
-        self._s.timeout = 0.03
+        self._s.timeout = 0
+        self._s.reset_input_buffer()
         self._s.write(f); self._s.flush()
         if addr == 0:
             return 0
-        resp = self._s.read(5)
-        if len(resp) != 5 or resp[0] != addr or resp[1] != (CMD_WRITE | 0x80):
-            return -1
-        if xor_checksum(resp[:-1]) != resp[-1]:
+        buf = self._read_reply_nonblocking(5, 0.03)
+        resp = self._find_reply(buf, addr, CMD_WRITE, 5)
+        if resp is None:
             return -1
         self.command_response.emit(CMD_WRITE, resp[2], b"")
         return resp[2]
