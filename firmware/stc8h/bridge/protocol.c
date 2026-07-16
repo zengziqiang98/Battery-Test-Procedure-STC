@@ -29,6 +29,7 @@
 #define CACHE_FAIL_COOLDOWN_TICKS 50
 #define CACHE_SUCCESS_COOLDOWN_TICKS 5
 #define CACHE_AFTER_SERIAL_COOLDOWN_TICKS 20
+#define SERIAL_LED_PULSE_TICKS 3
 
 static unsigned char proto_addr;
 static unsigned char tx_buf[128];
@@ -38,6 +39,8 @@ static unsigned char cache_scan_index;
 static unsigned char cache_fail_count;
 static unsigned char cache_cooldown;
 static unsigned char cache_online;
+static unsigned char rx_led_ticks;
+static unsigned char tx_led_ticks;
 
 
 static unsigned char xor_bytes(unsigned char *buf, unsigned char len)
@@ -47,10 +50,36 @@ static unsigned char xor_bytes(unsigned char *buf, unsigned char len)
     return ck;
 }
 
+static void mark_rx_activity(void)
+{
+    P03 = 0;
+    rx_led_ticks = SERIAL_LED_PULSE_TICKS;
+}
+
+static void mark_tx_activity(void)
+{
+    P02 = 0;
+    tx_led_ticks = SERIAL_LED_PULSE_TICKS;
+}
+
+static void serial_send_byte(unsigned char dat)
+{
+    unsigned char ie2_bak;
+
+    ie2_bak = IE2;
+    IE2 &= ~0x01;
+    CLR_TI2();
+    S2BUF = dat;
+    while (!TI2);
+    CLR_TI2();
+    IE2 = ie2_bak;
+}
+
 static void send_buf(unsigned char *buf, unsigned char len)
 {
     unsigned char i;
-    for (i = 0; i < len; i++) TX2_write2buff(buf[i]);
+    if (len > 0) mark_tx_activity();
+    for (i = 0; i < len; i++) serial_send_byte(buf[i]);
 }
 
 static unsigned char read_bridge_hw_addr(void)
@@ -159,6 +188,8 @@ static void cache_init(void)
     cache_fail_count = 0;
     cache_cooldown = 0;
     cache_online = 0;
+    rx_led_ticks = 0;
+    tx_led_ticks = 0;
     cache_store(REG_DEVICE_ID, 0x0101);
 }
 
@@ -363,10 +394,21 @@ void Protocol_Init(unsigned char addr)
     cache_init();
 }
 
+void Protocol_ActivityTick(void)
+{
+    if (rx_led_ticks > 0) {
+        if (--rx_led_ticks == 0) P03 = 1;
+    }
+    if (tx_led_ticks > 0) {
+        if (--tx_led_ticks == 0) P02 = 1;
+    }
+}
+
 void Protocol_Poll(void)
 {
     unsigned char len, expected;
 
+    if (COM2.RX_Cnt > 0) mark_rx_activity();
     if (COM2.RX_Cnt < 4) return;
 
     len = RX2_Buffer[2];

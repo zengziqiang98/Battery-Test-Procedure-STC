@@ -53,6 +53,7 @@
 
 /* API */
 void Protocol_Init(unsigned char addr);
+void Protocol_ActivityTick(void);
 void Protocol_Poll(void);
 void Protocol_Background(void);
 unsigned char Protocol_GetAddr(void);

@@ -29,6 +29,13 @@ static void Bridge_GPIO_config(void)
     g.Pin = GPIO_Pin_4 | GPIO_Pin_5 | GPIO_Pin_6 | GPIO_Pin_7;
     GPIO_Inilize(GPIO_P2, &g);
 
+    /* Serial activity LEDs: P0.3 RX, P0.2 TX, active low */
+    P03 = 1;
+    P02 = 1;
+    g.Mode = GPIO_OUT_PP;
+    g.Pin = GPIO_Pin_2 | GPIO_Pin_3;
+    GPIO_Inilize(GPIO_P0, &g);
+
     /* UART2 P1.0/P1.1 */
     g.Mode = GPIO_PullUp;
     g.Pin = GPIO_Pin_0 | GPIO_Pin_1;
@@ -62,10 +69,23 @@ void XOSC_Init(void)
     CLKSEL=0x01;
 }
 
+static void uart2_send_byte(unsigned char dat)
+{
+    unsigned char ie2_bak;
+
+    ie2_bak = IE2;
+    IE2 &= ~0x01;
+    CLR_TI2();
+    S2BUF = dat;
+    while (!TI2);
+    CLR_TI2();
+    IE2 = ie2_bak;
+}
+
 static void print_ready(void)
 {
     char *p="BRIDGE\r\n";
-    while(*p) TX2_write2buff(*p++);
+    while(*p) uart2_send_byte(*p++);
 }
 
 void main(void)
@@ -82,6 +102,7 @@ void main(void)
     while(1)
     {
         delay_ms(1);
+        Protocol_ActivityTick();
         Protocol_Poll();
         Protocol_Background();
 
