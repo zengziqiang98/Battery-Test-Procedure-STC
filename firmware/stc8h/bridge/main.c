@@ -60,13 +60,13 @@ void UART_config(void)
     UART2_SW(UART2_SW_P10_P11);
 }
 
-void XOSC_Init(void)
+void Clock_Init(void)
 {
     P_SW2|=0x80;
-    XOSCCR=0xC0;
-    while(!(XOSCCR&0x01));
+    HIRCCR=0x80;
+    while(!(HIRCCR&0x01));
     CLKDIV=0x00;
-    CLKSEL=0x01;
+    CLKSEL=0x00;
 }
 
 static void uart2_send_byte(unsigned char dat)
@@ -91,7 +91,7 @@ static void print_ready(void)
 void main(void)
 {
     EAXSFR();
-    XOSC_Init();
+    Clock_Init();
 
     Bridge_GPIO_config();
     UART_config();
